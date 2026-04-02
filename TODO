@@ -1,0 +1,8 @@
+* update on portal for queries is not working
+* instead of different queries keep that same, just search different sites with that
+* scoring in the actual script and test script is different, i feel test one is better
+* maybe add examples in prompt as well
+* for scoring the return should always have reason for each section along with disqualifers if any
+* there should be a level of flexibility, for example tasks or requirements that slighlty extend beyond reach can be considered, like if requirement is fullstack but candidate is backend with exp, if frontend is not the majority requirement of fullstack this should still generate a relatively higher score
+* whenever scoring, keep those links in mongodb along with score and reason for that score, to avoid repeated scoring when jobs runs the next time
+* the after date entry field is still then in the schedule page

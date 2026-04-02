@@ -1,0 +1,35 @@
+search:
+  freshness: "pw"  # pd=past day, pw=past week, pm=past month, py=past year
+  max_results_per_query: 20
+  base_query: >
+    ("Software Engineer" OR "Backend Engineer") ("Flutter" OR "Flutter Developer") India
+  sites:
+    - boards.greenhouse.io
+    - myworkdayjobs.com
+    - lever.co
+    - jobs.ashbyhq.com
+    - jobs.smartrecruiters.com
+
+candidate_profile: |
+  - 2 years of full-time post-graduation experience in backend/infra engineering
+  - 2 years of prior contract experience during college (counts as profile depth, not toward YOE filters)
+  - Primary language: Golang (production systems, internal tools, ABDM healthcare integration)
+  - Secondary: TypeScript, Node.js, Python
+  - Strong experience with: PostgreSQL, Redis, MongoDB, Docker, Kubernetes, AWS
+  - Domain experience: Healthcare tech (ABDM/NHA certified), logistics, crypto/web3 infra
+  - Built IAM systems, search infrastructure (Typesense), data pipelines (ClickHouse + PeerDB)
+  - Comfortable with system design, DevOps, CI/CD, performance optimization
+  - Education: B.Tech CSE, SRM (9.1 CGPA, 2024)
+  - Location: India (open to Hyderabad, Bangalore, Gurugram, Delhi NCR, Pune, Chennai, Remote)
+  - Target: Junior to mid-level SDE/Backend roles
+  - YOE fit: 2 yrs required = perfect | 3 yrs = comfortable applying | 4 yrs = stretch | 5+ = skip
+
+filtering:
+  min_score: 60
+
+openai:
+  model: "gpt-4o-mini"
+
+recipient_email: "eshansingh2409@gmail.com"
+
+schedule: "0 9 * * *"

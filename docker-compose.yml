@@ -1,0 +1,8 @@
+services:
+  jobscout:
+    build: .
+    ports:
+      - "${PORT:-6969}:${PORT:-6969}"
+    env_file:
+      - .env
+    restart: unless-stopped
