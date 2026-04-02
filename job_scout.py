@@ -527,6 +527,7 @@ def send_email(recipient, matched, borderline):
 
     icloud_mail = os.environ.get("ICLOUD_EMAIL", "").strip()
     app_password = os.environ.get("APP_SPECIFIC_PASSWORD", "").strip()
+    sender_mail = (os.environ.get("SENDER_MAIL") or icloud_mail).strip()
     recipient = (recipient or "").strip()
 
     if not all([icloud_mail, app_password, recipient]):
@@ -539,7 +540,7 @@ def send_email(recipient, matched, borderline):
 
     msg = EmailMessage()
     msg["Subject"] = f"Job Scout: {len(matched)} new match{'es' if len(matched) != 1 else ''} found"
-    msg["From"] = icloud_mail
+    msg["From"] = sender_mail
     msg["To"] = recipient
     msg.add_alternative(html, subtype="html")
 

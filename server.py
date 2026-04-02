@@ -176,9 +176,11 @@ def _enrich_config_for_api(config):
     c = copy.deepcopy(config)
     c["openai"]["api_key"] = _redact(os.environ.get("OPENAI_API_KEY", ""))
     icloud_email = os.environ.get("ICLOUD_EMAIL", "")
+    sender_mail = os.environ.get("SENDER_MAIL", "").strip() or icloud_email
     c["env_secrets"] = {
         "brave_api_key": _redact(os.environ.get("BRAVE_API_KEY", "")),
         "icloud_email": _redact(icloud_email),
+        "sender_mail": _redact(sender_mail),
         "app_specific_password": "••••-••••-••••-••••",
     }
     return c
