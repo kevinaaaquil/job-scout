@@ -2,7 +2,7 @@ search:
   freshness: "pw"  # pd=past day, pw=past week, pm=past month, py=past year
   max_results_per_query: 20
   base_query: >
-    ("Software Engineer" OR "Backend Engineer") ("Flutter" OR "Flutter Developer") India
+    ("Software Engineer" OR "Backend Engineer" OR "SDE" OR "Backend Developer" OR "Software Developer")  India
   sites:
     - boards.greenhouse.io
     - myworkdayjobs.com
@@ -20,7 +20,7 @@ candidate_profile: |
   - Built IAM systems, search infrastructure (Typesense), data pipelines (ClickHouse + PeerDB)
   - Comfortable with system design, DevOps, CI/CD, performance optimization
   - Education: B.Tech CSE, SRM (9.1 CGPA, 2024)
-  - Location: India (open to Hyderabad, Bangalore, Gurugram, Delhi NCR, Pune, Chennai, Remote)
+  - Location: India only. Open to on-site in Hyderabad, Bangalore, Gurugram, Delhi NCR, Pune, Chennai. Remote is fine only if the company/role is based in or hiring from India. Disqualify remote roles that require relocation outside India or are not available to India-based candidates.
   - Target: Junior to mid-level SDE/Backend roles
   - YOE fit: 2 yrs required = perfect | 3 yrs = comfortable applying | 4 yrs = stretch | 5+ = skip
 

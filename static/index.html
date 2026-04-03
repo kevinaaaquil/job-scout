@@ -190,6 +190,7 @@
     <div class="status-item" id="statusLast"></div>
     <div class="spacer"></div>
     <button id="runNowBtn" onclick="triggerRun()">Run Now</button>
+    <button class="secondary" onclick="logout()">Logout</button>
   </div>
 
   <div class="tabs">
@@ -278,6 +279,11 @@
         <label>Minimum Match Score (0-100)</label>
         <input type="number" id="minScoreInput" min="0" max="100" placeholder="60">
       </div>
+      <div class="form-row">
+        <label>Borderline Threshold (0-100)</label>
+        <input type="number" id="borderlineThresholdInput" min="0" max="100" placeholder="40">
+        <p style="font-size:0.75rem;color:var(--text2);margin-top:4px;">Jobs scoring between this and the minimum score are shown as "borderline".</p>
+      </div>
       <div class="form-actions">
         <button onclick="saveProfile()">Save Profile</button>
       </div>
@@ -297,6 +303,15 @@
       </div>
       <div class="form-actions">
         <button onclick="saveRecipient()">Save Recipient</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Seen Jobs</h3>
+      <p style="font-size:0.8rem;color:var(--text2);margin-bottom:12px;">
+        Clear the seen-jobs list to re-evaluate previously found URLs on the next run.
+      </p>
+      <div class="form-actions" style="justify-content:flex-start;">
+        <button class="danger" onclick="clearSeen()">Clear All Seen Jobs</button>
       </div>
     </div>
     <div class="card">
@@ -345,6 +360,10 @@ async function api(path, opts = {}) {
     headers: { 'Content-Type': 'application/json' },
     ...opts,
   });
+  if (res.status === 401 && path !== '/login') {
+    window.location.href = '/';
+    throw new Error('Unauthorized');
+  }
   return res.json();
 }
 
@@ -377,8 +396,7 @@ async function refreshStatus() {
 
   if (running && !statusPoll) {
     statusPoll = setInterval(async () => {
-      await refreshStatus();
-      const st = await api('/status');
+      const st = await refreshStatus();
       if (!st.running) {
         clearInterval(statusPoll);
         statusPoll = null;
@@ -386,6 +404,15 @@ async function refreshStatus() {
       }
     }, 3000);
   }
+
+  return s;
+}
+
+// ── Auth ────────────────────────────────────────────────────────────
+
+async function logout() {
+  await api('/logout', { method: 'POST' });
+  window.location.href = '/';
 }
 
 // ── Trigger run ─────────────────────────────────────────────────────
@@ -484,9 +511,11 @@ async function showRunDetail(id) {
     </div>`;
 }
 
+let appTimezone = 'Asia/Kolkata';
+
 function fmtTime(iso) {
   return new Date(iso).toLocaleString('en-IN', {
-    timeZone: 'Asia/Kolkata',
+    timeZone: appTimezone,
     year: 'numeric', month: 'short', day: 'numeric',
     hour: 'numeric', minute: '2-digit',
     hour12: true,
@@ -629,6 +658,7 @@ async function loadProfile() {
   const config = await api('/config');
   $('#profileInput').value = config.candidate_profile || '';
   $('#minScoreInput').value = config.filtering?.min_score || 60;
+  $('#borderlineThresholdInput').value = config.filtering?.borderline_threshold || 40;
 }
 
 async function saveProfile() {
@@ -636,7 +666,10 @@ async function saveProfile() {
     method: 'PUT',
     body: JSON.stringify({
       candidate_profile: $('#profileInput').value,
-      filtering: { min_score: parseInt($('#minScoreInput').value) || 60 },
+      filtering: {
+        min_score: parseInt($('#minScoreInput').value) || 60,
+        borderline_threshold: parseInt($('#borderlineThresholdInput').value) || 40,
+      },
     }),
   });
   toast('Profile saved');
@@ -651,6 +684,16 @@ async function loadSettings() {
   if (el) el.value = config.openai?.model || 'gpt-4o-mini';
 }
 
+async function clearSeen() {
+  if (!confirm('Clear all seen jobs? Next run will re-evaluate everything.')) return;
+  try {
+    const res = await api('/seen', { method: 'DELETE' });
+    toast(res.message || 'Cleared');
+  } catch (e) {
+    toast('Failed to clear seen jobs', true);
+  }
+}
+
 async function saveRecipient() {
   await api('/config', {
     method: 'PUT',
@@ -661,7 +704,15 @@ async function saveRecipient() {
 
 // ── Init ────────────────────────────────────────────────────────────
 
+async function loadTimezone() {
+  try {
+    const res = await api('/timezone');
+    if (res.timezone) appTimezone = res.timezone;
+  } catch (e) { /* keep default */ }
+}
+
 async function init() {
+  await loadTimezone();
   await Promise.all([
     refreshStatus(),
     refreshRuns(),

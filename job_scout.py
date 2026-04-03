@@ -1,3 +1,4 @@
+import html as html_mod
 import json
 import logging
 import os
@@ -5,6 +6,7 @@ import smtplib
 import ssl
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -12,7 +14,8 @@ from pathlib import Path
 import requests
 import yaml
 from bs4 import BeautifulSoup
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, RateLimitError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from pymongo import UpdateOne
 
@@ -84,7 +87,7 @@ DEFAULT_CONFIG = {
         "queries": [],  # legacy: used if base_query + sites are empty
     },
     "candidate_profile": "",
-    "filtering": {"min_score": 60},
+    "filtering": {"min_score": 60, "borderline_threshold": 40},
     "openai": {"model": "gpt-4o-mini"},
     "recipient_email": "",
     "schedule": "0 9 * * *",
@@ -180,6 +183,24 @@ def mark_jobs_seen(all_results, scored_jobs=None):
         db.seen_jobs.bulk_write(ops_score, ordered=False)
 
 
+# ── Clear seen jobs ──────────────────────────────────────────────────
+
+def clear_all_seen():
+    """Remove all seen_jobs records, allowing full re-evaluation."""
+    db = get_db()
+    result = db.seen_jobs.delete_many({})
+    logger.info("Cleared %d seen jobs", result.deleted_count)
+    return result.deleted_count
+
+
+def clear_seen_urls(urls):
+    """Remove specific URLs from seen_jobs for re-evaluation."""
+    db = get_db()
+    result = db.seen_jobs.delete_many({"url": {"$in": urls}})
+    logger.info("Cleared %d seen jobs", result.deleted_count)
+    return result.deleted_count
+
+
 # ── Run history (MongoDB) ─────────────────────────────────────────────
 
 def load_run_history():
@@ -265,10 +286,17 @@ BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 BRAVE_TIMEOUT = 25
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+    reraise=True,
+)
 def _brave_search(query, api_key, freshness, max_results=20):
     """Single Brave Search API call (max 20 results per request).
 
     Returns (results, error_message). Each result is {"url": ..., "title": ...}.
+    Raises on transient connection/timeout errors (retried automatically).
     """
     headers = {
         "X-Subscription-Token": api_key,
@@ -281,32 +309,27 @@ def _brave_search(query, api_key, freshness, max_results=20):
     if freshness:
         params["freshness"] = freshness
 
-    try:
-        resp = requests.get(BRAVE_ENDPOINT, headers=headers, params=params, timeout=BRAVE_TIMEOUT)
-        if not resp.ok:
-            try:
-                err_data = resp.json()
-                detail = str(err_data)[:300]
-            except Exception:
-                detail = resp.text[:300] if resp.text else resp.reason
-            logger.error("  Brave API HTTP %s - %s", resp.status_code, detail)
-            return [], f"HTTP {resp.status_code}: {detail}"
+    resp = requests.get(BRAVE_ENDPOINT, headers=headers, params=params, timeout=BRAVE_TIMEOUT)
+    if not resp.ok:
+        try:
+            err_data = resp.json()
+            detail = str(err_data)[:300]
+        except Exception:
+            detail = resp.text[:300] if resp.text else resp.reason
+        logger.error("  Brave API HTTP %s - %s", resp.status_code, detail)
+        return [], f"HTTP {resp.status_code}: {detail}"
 
-        data = resp.json()
-        web = data.get("web") or {}
-        items = web.get("results") or []
+    data = resp.json()
+    web = data.get("web") or {}
+    items = web.get("results") or []
 
-        results = []
-        for item in items:
-            results.append({
-                "url": item.get("url", ""),
-                "title": item.get("title", ""),
-            })
-        return results, None
-
-    except requests.exceptions.RequestException as e:
-        logger.error("  Brave request failed: %s", e)
-        return [], str(e)
+    results = []
+    for item in items:
+        results.append({
+            "url": item.get("url", ""),
+            "title": item.get("title", ""),
+        })
+    return results, None
 
 
 def run_searches(queries, max_results, freshness="pw"):
@@ -374,6 +397,39 @@ def deduplicate(results):
 
 # ── Step 4: Fetch job page content ─────────────────────────────────────
 
+def _extract_main_content(soup, max_chars=4000):
+    """Try to find main content area, then truncate at sentence boundary."""
+    main = soup.find("main") or soup.find("article") or soup.find(attrs={"role": "main"})
+    if main:
+        text = main.get_text(separator="\n", strip=True)
+    else:
+        text = soup.get_text(separator="\n", strip=True)
+
+    if len(text) <= max_chars:
+        return text
+
+    truncated = text[:max_chars]
+    for end_char in ['. ', '.\n', '! ', '!\n', '? ', '?\n']:
+        last_pos = truncated.rfind(end_char)
+        if last_pos > max_chars * 0.5:
+            return truncated[:last_pos + 1]
+
+    return truncated
+
+
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=1, max=5),
+    retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+    reraise=True,
+)
+def _fetch_page_request(url, headers, timeout):
+    """HTTP GET with retry on transient errors."""
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp
+
+
 def fetch_job_page(url, timeout=15):
     headers = {
         "User-Agent": (
@@ -382,16 +438,14 @@ def fetch_job_page(url, timeout=15):
         )
     }
     try:
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
+        resp = _fetch_page_request(url, headers, timeout)
         soup = BeautifulSoup(resp.text, "html.parser")
 
         for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
             tag.decompose()
 
         title = soup.title.string.strip() if soup.title and soup.title.string else ""
-        body_text = soup.get_text(separator="\n", strip=True)
-        body_text = body_text[:4000]
+        body_text = _extract_main_content(soup)
         return {"title": title, "text": body_text}
     except Exception as e:
         logger.warning("Failed to fetch %s: %s", url, e)
@@ -400,10 +454,30 @@ def fetch_job_page(url, timeout=15):
 
 # ── Step 5: OpenAI scoring ─────────────────────────────────────────────
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    retry=retry_if_exception_type((APIConnectionError, RateLimitError)),
+    reraise=True,
+)
+def _openai_score_request(client, model, system_prompt, user_message):
+    """OpenAI chat completion with retry on transient errors."""
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        temperature=0.1,
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message.content
+
+
 def score_job(client, model, candidate_profile, job):
     job_text = job.get("text", "")
     if not job_text or len(job_text) < 50:
-        return normalize_score_result({
+        result = normalize_score_result({
             "match_score": 0,
             "breakdown": {
                 "experience": {"score": 0, "reason": "No content to evaluate."},
@@ -413,24 +487,17 @@ def score_job(client, model, candidate_profile, job):
             },
             "disqualifiers": ["Page not accessible"],
         })
+        result["_score_failed"] = True
+        return result
 
     user_message = f"CANDIDATE PROFILE:\n{candidate_profile}\n\nJOB POSTING:\n{job_text}"
 
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.1,
-            response_format={"type": "json_object"},
-        )
-        content = response.choices[0].message.content
+        content = _openai_score_request(client, model, SYSTEM_PROMPT, user_message)
         return normalize_score_result(json.loads(content))
     except Exception as e:
         logger.error("OpenAI scoring failed for %s: %s", job.get("url", "?"), e)
-        return normalize_score_result({
+        result = normalize_score_result({
             "match_score": 0,
             "breakdown": {
                 "experience": {"score": 0, "reason": str(e)[:120]},
@@ -440,6 +507,8 @@ def score_job(client, model, candidate_profile, job):
             },
             "disqualifiers": [],
         })
+        result["_score_failed"] = True
+        return result
 
 
 def score_jobs(config, jobs):
@@ -451,25 +520,38 @@ def score_jobs(config, jobs):
     min_score = config["filtering"].get("min_score", 60)
 
     client = OpenAI(api_key=api_key)
-    scored = []
-    seen_urls = set()
 
+    # Dedup by URL
+    unique_jobs = []
+    seen_urls = set()
     for job in jobs:
         url = job.get("url", "")
-        if not url or url in seen_urls:
-            continue
-        seen_urls.add(url)
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            unique_jobs.append(job)
 
+    def _score_one(job):
         result = score_job(client, model, candidate_profile, job)
         job["match_score"] = result.get("match_score", 0)
         job["reasons"] = result.get("reasons", [])
         job["disqualifiers"] = result.get("disqualifiers", [])
         job["score_breakdown"] = result.get("score_breakdown", {})
-        scored.append(job)
+        job["_score_failed"] = result.get("_score_failed", False)
         logger.info("  Scored %s — %d (%s)", job["url"][:60], job["match_score"], job["title"][:40])
+        return job
 
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        all_attempted = list(pool.map(_score_one, unique_jobs))
+
+    # Only count successfully scored jobs; failed ones will be retried next run
+    scored = [j for j in all_attempted if not j.get("_score_failed")]
+    failed = [j for j in all_attempted if j.get("_score_failed")]
+    if failed:
+        logger.info("  %d jobs failed scoring and will be retried next run", len(failed))
+
+    borderline_threshold = config["filtering"].get("borderline_threshold", 40)
     matched = [j for j in scored if j["match_score"] >= min_score]
-    borderline = [j for j in scored if 40 <= j["match_score"] < min_score]
+    borderline = [j for j in scored if borderline_threshold <= j["match_score"] < min_score]
     matched.sort(key=lambda j: j["match_score"], reverse=True)
     borderline.sort(key=lambda j: j["match_score"], reverse=True)
 
@@ -503,18 +585,22 @@ def build_email_html(matched, borderline):
 
 
 def _job_card(job, color):
-    reasons_html = "".join(f"<li>{r}</li>" for r in job.get("reasons", [])[:5])
+    esc = html_mod.escape
+    reasons_html = "".join(f"<li>{esc(r)}</li>" for r in job.get("reasons", [])[:5])
     disqualifiers_html = ""
     if job.get("disqualifiers"):
-        dq = "".join(f"<li style='color:#dc2626;'>{d}</li>" for d in job["disqualifiers"][:2])
+        dq = "".join(f"<li style='color:#dc2626;'>{esc(d)}</li>" for d in job["disqualifiers"][:2])
         disqualifiers_html = f"<p style='margin:2px 0;font-size:13px;'><strong>Flags:</strong></p><ul style='margin:2px 0;'>{dq}</ul>"
 
+    title = esc(job.get('title', 'Untitled'))
+    source = esc(job.get('source', ''))
+    url = esc(job.get('url', ''))
     return f"""
     <div style="border-left: 4px solid {color}; padding: 10px 14px; margin: 12px 0; background: #f9fafb; border-radius: 4px;">
-        <p style="margin:0;font-size:15px;"><strong>{job.get('title', 'Untitled')}</strong>
+        <p style="margin:0;font-size:15px;"><strong>{title}</strong>
            <span style="color:{color};font-weight:bold;float:right;">{job['match_score']}/100</span></p>
-        <p style="margin:4px 0;font-size:13px;color:#6b7280;">{job['source']} &middot;
-           <a href="{job['url']}" style="color:#2563eb;">View posting</a></p>
+        <p style="margin:4px 0;font-size:13px;color:#6b7280;">{source} &middot;
+           <a href="{url}" style="color:#2563eb;">View posting</a></p>
         <ul style="margin:4px 0;font-size:13px;">{reasons_html}</ul>
         {disqualifiers_html}
     </div>"""
@@ -613,9 +699,7 @@ def send_ntfy(freshness, matched_count, recipient):
 
 def run(on_progress=None):
     """Execute a full job scout run. Returns the run record dict."""
-    _ensure_indexes()
-
-    run_id = str(uuid.uuid4())[:8]
+    run_id = uuid.uuid4().hex[:12]
     run_record = {
         "id": run_id,
         "timestamp": datetime.now().isoformat(),
@@ -667,13 +751,18 @@ def run(on_progress=None):
             send_ntfy(freshness, 0, "")
             return run_record
 
-        # Step 4: Fetch pages
+        # Step 4: Fetch pages (parallel)
         progress("fetch", f"Fetching {len(new_results)} job pages")
-        for job in new_results:
+
+        def _fetch_and_attach(job):
             page = fetch_job_page(job["url"])
             if not job.get("title"):
                 job["title"] = page["title"]
             job["text"] = page["text"]
+            return job
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            list(pool.map(_fetch_and_attach, new_results))
 
         # Step 5: Score
         progress("score", f"Scoring {len(new_results)} jobs with OpenAI")
@@ -689,7 +778,7 @@ def run(on_progress=None):
         run_record["borderline_jobs"] = serializable(borderline)
         run_record["all_scored_jobs"] = serializable(all_scored)
 
-        mark_jobs_seen(all_results, all_scored)
+        mark_jobs_seen(all_scored, all_scored)
 
         # Step 6: Email
         if matched or borderline:
