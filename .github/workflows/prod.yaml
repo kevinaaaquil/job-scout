@@ -20,7 +20,7 @@ jobs:
         uses: idoberko2/dokku-deploy-github-action@v1.0.1
         with:
           ssh-private-key: ${{ secrets.FMKO_GCP_DOKKU_KEY }}
-          dokku-host: "34.93.23.75"
+          dokku-host: "34.100.170.145"
           ssh-port: "22"
           app-name: "jobscout"
           git-push-flags: "--force"
