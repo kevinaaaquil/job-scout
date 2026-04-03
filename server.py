@@ -6,15 +6,18 @@ import threading
 from functools import wraps
 from zoneinfo import ZoneInfo
 
-import bcrypt
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import Flask, jsonify, request, send_from_directory, session
 
 import job_scout
+from db import get_db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger("server")
+
+# Plain-text passwords (MongoDB + .env) for now; hashing later.
+ADMIN_USERS_COLLECTION = "admin_users"
 
 APP_TZ = ZoneInfo(os.environ.get("TZ", "Asia/Kolkata"))
 
@@ -29,17 +32,50 @@ _current_run_status = {"running": False, "stage": "", "detail": ""}
 # ── Auth ──────────────────────────────────────────────────────────────
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-_admin_password_raw = os.environ.get("ADMIN_PASSWORD", "")
-ADMIN_PASSWORD_HASH = bcrypt.hashpw(_admin_password_raw.encode(), bcrypt.gensalt()) if _admin_password_raw else None
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
-if not ADMIN_PASSWORD_HASH:
-    logger.warning("ADMIN_PASSWORD not set — auth disabled, app is open")
+
+def _mongo_has_login_users():
+    try:
+        col = get_db()[ADMIN_USERS_COLLECTION]
+        return (
+            col.count_documents(
+                {
+                    "username": {"$exists": True, "$nin": [None, ""]},
+                    "password": {"$exists": True, "$nin": [None, ""]},
+                },
+                limit=1,
+            )
+            > 0
+        )
+    except Exception as exc:
+        logger.warning("MongoDB admin user check failed: %s", exc)
+        return False
+
+
+def _auth_enabled():
+    return bool(ADMIN_PASSWORD) or _mongo_has_login_users()
+
+
+def _credentials_valid(username, password):
+    """MongoDB first (plain password on user doc). If no matching Mongo user, fall back to .env."""
+    try:
+        doc = get_db()[ADMIN_USERS_COLLECTION].find_one({"username": username})
+        if doc is not None:
+            stored = doc.get("password") or ""
+            return stored == password
+    except Exception as exc:
+        logger.warning("MongoDB login lookup failed: %s", exc)
+
+    if ADMIN_PASSWORD and username == ADMIN_USER:
+        return ADMIN_PASSWORD == password
+    return False
 
 
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if ADMIN_PASSWORD_HASH is None:
+        if not _auth_enabled():
             return f(*args, **kwargs)
         if not session.get("authed"):
             if request.path.startswith("/api/"):
@@ -102,7 +138,10 @@ def api_login():
     data = request.get_json() or {}
     user = data.get("username", "")
     pw = data.get("password", "")
-    if ADMIN_PASSWORD_HASH and user == ADMIN_USER and bcrypt.checkpw(pw.encode(), ADMIN_PASSWORD_HASH):
+    if not _auth_enabled():
+        session["authed"] = True
+        return jsonify({"message": "OK"})
+    if _credentials_valid(user, pw):
         session["authed"] = True
         return jsonify({"message": "OK"})
     return jsonify({"error": "Invalid credentials"}), 401

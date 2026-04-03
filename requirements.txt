@@ -6,4 +6,3 @@ pymongo
 beautifulsoup4
 requests
 tenacity
-bcrypt
