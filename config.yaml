@@ -1,14 +1,40 @@
 search:
-  freshness: "pw"  # pd=past day, pw=past week, pm=past month, py=past year
+  freshness: "pm"  # pd=past day, pw=past week, pm=past month, py=past year
   max_results_per_query: 20
-  base_query: >
-    ("Software Engineer" OR "Backend Engineer" OR "SDE" OR "Backend Developer" OR "Software Developer")  India
+
+  # Query templates: each is run against every site.
+  # Use multiple templates to target different angles (location, tech, remote).
+  query_templates:
+    # Query A — Location-locked title search (city names, not "India")
+    - name: location
+      query: >
+        ("Software Engineer" OR "Backend Engineer" OR "SDE" OR "Backend Developer")
+        ("Bangalore" OR "Bengaluru" OR "Hyderabad" OR "Gurugram" OR "Gurgaon" OR "Pune" OR "Delhi" OR "Noida" OR "Chennai")
+    # Query B — Tech-locked + location (catches Go roles regardless of title)
+    - name: golang
+      query: >
+        ("Golang" OR "Go developer" OR "Go engineer")
+        ("Bangalore" OR "Bengaluru" OR "Hyderabad" OR "Gurugram" OR "Gurgaon" OR "Pune" OR "Delhi" OR "Noida" OR "Chennai" OR "India")
+    # Query C — TypeScript/Node.js + location (catches TS roles regardless of title)
+    - name: typescript
+      query: >
+        ("TypeScript" OR "Node.js" OR "NodeJS" OR "NestJS")
+        ("Bangalore" OR "Bengaluru" OR "Hyderabad" OR "Gurugram" OR "Gurgaon" OR "Pune" OR "Delhi" OR "Noida" OR "Chennai" OR "India")
+    # Query D — Remote roles that specifically mention India
+    - name: remote
+      query: >
+        ("Software Engineer" OR "Backend Engineer" OR "SDE")
+        ("Remote" AND "India")
+
   sites:
     - boards.greenhouse.io
     - myworkdayjobs.com
     - lever.co
     - jobs.ashbyhq.com
     - jobs.smartrecruiters.com
+    - cutshort.io
+    - instahyre.com
+    - wellfound.com
 
 candidate_profile: |
   - 2 years of full-time post-graduation experience in backend/infra engineering
@@ -26,6 +52,27 @@ candidate_profile: |
 
 filtering:
   min_score: 60
+  prefilter:
+    enabled: true
+    # Page must contain at least one of these (case-insensitive) or it's skipped before AI scoring
+    location_keywords:
+      - india
+      - bangalore
+      - bengaluru
+      - hyderabad
+      - gurugram
+      - gurgaon
+      - pune
+      - delhi
+      - noida
+      - chennai
+      - remote
+    # Jobs with these words in the title are skipped (too senior)
+    skip_title_patterns:
+      - senior
+      - staff
+      - principal
+      - director
 
 openai:
   model: "gpt-4o-mini"

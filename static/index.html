@@ -206,7 +206,7 @@
     <div class="card">
       <table>
         <thead>
-          <tr><th>Time</th><th>Status</th><th>Found</th><th>New</th><th>Matched</th><th>Email</th></tr>
+          <tr><th>Time</th><th>Status</th><th>Found</th><th>New</th><th>Pre-filter</th><th>Matched</th><th>Email</th></tr>
         </thead>
         <tbody id="runsTable"></tbody>
       </table>
@@ -222,7 +222,7 @@
     <div class="card">
       <h3>Brave Search</h3>
       <p style="font-size:0.8rem;color:var(--text2);margin-bottom:12px;">
-        One base query is combined with each job-board host as <code style="background:var(--bg);padding:2px 6px;border-radius:4px;">site:host …</code>. Saved only when you click Save.
+        Each query template is run against every board host as <code style="background:var(--bg);padding:2px 6px;border-radius:4px;">site:host {query}</code>. Saved only when you click Save.
       </p>
       <div class="form-row">
         <label>Brave search freshness</label>
@@ -233,11 +233,11 @@
           <option value="pm">Past month</option>
           <option value="py">Past year</option>
         </select>
-        <p style="font-size:0.75rem;color:var(--text2);margin-top:6px;">Maps to Brave API <code style="background:var(--bg);padding:2px 6px;border-radius:4px;">freshness</code> when set.</p>
       </div>
       <div class="form-row">
-        <label>Base query</label>
-        <textarea id="baseQueryInput" rows="4" placeholder='("Software Engineer" OR "Backend") India'></textarea>
+        <label>Query templates</label>
+        <div id="templatesList"></div>
+        <button type="button" class="secondary" onclick="addTemplate()" style="margin-top:8px;">+ Add template</button>
       </div>
       <div class="form-row">
         <label>Board hosts (one per row)</label>
@@ -451,11 +451,15 @@ async function refreshRuns() {
     const emailBadge = r.email_sent
       ? '<span class="badge badge-blue">sent</span>'
       : '<span class="badge" style="color:var(--text2)">—</span>';
+    const pfText = r.jobs_prefilter_passed != null
+      ? `${r.jobs_prefilter_passed}/${r.jobs_new}`
+      : '—';
     return `<tr onclick="showRunDetail('${r.id}')">
       <td>${fmtTime(r.timestamp)}</td>
       <td>${statusBadge}</td>
       <td>${r.jobs_found}</td>
       <td>${r.jobs_new}</td>
+      <td>${pfText}</td>
       <td>${r.jobs_matched}</td>
       <td>${emailBadge}</td>
     </tr>`;
@@ -500,9 +504,10 @@ async function showRunDetail(id) {
     <div class="card run-detail">
       <h3>Run ${escHtml(r.id)} — ${fmtTime(r.timestamp)}</h3>
       <p style="font-size:0.85rem;color:var(--text2);">
-        Found: ${r.jobs_found} &middot; New: ${r.jobs_new} &middot;
-        Scored: ${r.jobs_scored} &middot; Matched: ${r.jobs_matched} &middot;
-        Borderline: ${r.jobs_borderline || 0}
+        Found: ${r.jobs_found} &rarr; New: ${r.jobs_new} &rarr;
+        Pre-filter: ${r.jobs_prefilter_passed ?? '—'}/${r.jobs_new} &rarr;
+        Scored: ${r.jobs_scored} &rarr; Matched: ${r.jobs_matched} +
+        ${r.jobs_borderline || 0} borderline
       </p>
       ${errorHtml}
       ${matchedHtml}
@@ -527,26 +532,38 @@ function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-// ── Search (base query + sites) ─────────────────────────────────────
+// ── Search (query templates + sites) ────────────────────────────────
 
 let sitesData = [];
+let templatesData = [];
 
-function parseLegacyQueries(queries) {
-  const sites = [];
-  let base = '';
-  for (const q of queries) {
-    const raw = String(q.query || '').trim();
-    const m = raw.match(/^site:(\S+)\s+([\s\S]+)$/i);
-    if (m) {
-      sites.push(m[1]);
-      const rest = m[2].replace(/\s+/g, ' ').trim();
-      if (!base) base = rest;
-    } else if (raw) {
-      sites.push(String(q.name || 'board').replace(/\s+/g, '') || 'board');
-      if (!base) base = raw;
-    }
-  }
-  return { base, sites };
+function renderTemplates() {
+  $('#templatesList').innerHTML = templatesData.map((t, i) => `
+    <div class="query-item">
+      <div class="query-item-header">
+        <input type="text" value="${escHtml(t.name)}" placeholder="name" style="width:140px;" data-tmpl-name="${i}">
+        <button type="button" class="secondary danger" onclick="templatesData.splice(${i},1);renderTemplates();" style="padding:4px 12px;font-size:0.8rem;">Remove</button>
+      </div>
+      <textarea rows="2" placeholder='("Software Engineer" OR "Backend") ("Bangalore" OR "Hyderabad")' data-tmpl-query="${i}">${escHtml(t.query)}</textarea>
+    </div>
+  `).join('');
+}
+
+function collectTemplatesFromDom() {
+  const out = [];
+  templatesData.forEach((_, i) => {
+    const nameEl = document.querySelector(`[data-tmpl-name="${i}"]`);
+    const queryEl = document.querySelector(`[data-tmpl-query="${i}"]`);
+    if (!nameEl || !queryEl) return;
+    const q = queryEl.value.trim();
+    if (q) out.push({ name: nameEl.value.trim() || 'q', query: q });
+  });
+  return out;
+}
+
+function addTemplate() {
+  templatesData.push({ name: '', query: '' });
+  renderTemplates();
 }
 
 function renderSites() {
@@ -563,6 +580,15 @@ function addSite() {
   renderSites();
 }
 
+function collectSitesFromDom() {
+  const hosts = [];
+  $$('#sitesList .site-item input[type="text"]').forEach(inp => {
+    const v = inp.value.trim();
+    if (v) hosts.push(v);
+  });
+  return hosts;
+}
+
 function applyFreshnessToSelect(raw) {
   const sel = $('#searchFreshness');
   if (!sel) return;
@@ -575,46 +601,36 @@ async function loadQueries() {
   const config = await api('/config');
   const s = config.search || {};
   applyFreshnessToSelect(s.freshness);
-  if (s.base_query || (s.sites && s.sites.length)) {
-    $('#baseQueryInput').value = s.base_query || '';
-    sitesData = (s.sites || []).map(h => ({ host: h }));
-  } else if (s.queries && s.queries.length) {
-    const { base, sites } = parseLegacyQueries(s.queries);
-    $('#baseQueryInput').value = base;
-    sitesData = sites.map(h => ({ host: h }));
-  } else {
-    $('#baseQueryInput').value = '';
-    sitesData = [];
-  }
+
+  templatesData = (s.query_templates || []).map(t => ({
+    name: t.name || '',
+    query: t.query || '',
+  }));
+  if (!templatesData.length) templatesData = [{ name: '', query: '' }];
+  renderTemplates();
+
+  sitesData = (s.sites || []).map(h => ({ host: h }));
   if (!sitesData.length) sitesData = [{ host: '' }];
   renderSites();
 }
 
-function collectSitesFromDom() {
-  const hosts = [];
-  $$('#sitesList .site-item input[type="text"]').forEach(inp => {
-    const v = inp.value.trim();
-    if (v) hosts.push(v);
-  });
-  return hosts;
-}
-
 async function saveQueries() {
-  const base = $('#baseQueryInput').value.trim();
+  const templates = collectTemplatesFromDom();
   const sites = collectSitesFromDom();
   const freshness = $('#searchFreshness').value;
   const config = await api('/config');
   const search = {
     ...(config.search || {}),
     freshness: freshness || '',
-    base_query: base,
+    query_templates: templates,
     sites,
-    queries: [],
   };
   await api('/config', {
     method: 'PUT',
     body: JSON.stringify({ search }),
   });
+  templatesData = templates.length ? templates : [{ name: '', query: '' }];
+  renderTemplates();
   sitesData = sites.length ? sites.map(h => ({ host: h })) : [{ host: '' }];
   renderSites();
   toast('Queries saved');
@@ -662,14 +678,17 @@ async function loadProfile() {
 }
 
 async function saveProfile() {
+  const config = await api('/config');
+  const filtering = {
+    ...(config.filtering || {}),
+    min_score: parseInt($('#minScoreInput').value) || 60,
+    borderline_threshold: parseInt($('#borderlineThresholdInput').value) || 40,
+  };
   await api('/config', {
     method: 'PUT',
     body: JSON.stringify({
       candidate_profile: $('#profileInput').value,
-      filtering: {
-        min_score: parseInt($('#minScoreInput').value) || 60,
-        borderline_threshold: parseInt($('#borderlineThresholdInput').value) || 40,
-      },
+      filtering,
     }),
   });
   toast('Profile saved');

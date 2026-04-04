@@ -25,6 +25,13 @@ logger = logging.getLogger("job_scout")
 
 SEED_CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
+# Pre-filter defaults (used in DEFAULT_CONFIG and as fallback in pre_filter_jobs)
+DEFAULT_LOCATION_KEYWORDS = [
+    "india", "bangalore", "bengaluru", "hyderabad", "gurugram", "gurgaon",
+    "pune", "delhi", "noida", "chennai", "remote",
+]
+DEFAULT_SKIP_TITLE_PATTERNS = ["senior", "staff", "principal", "director"]
+
 SYSTEM_PROMPT = """You are a job-matching assistant. Given the candidate profile and a job posting, score the match and return a JSON object.
 
 CANDIDATE PROFILE BLOCK (abuse / cost control):
@@ -82,12 +89,19 @@ DEFAULT_CONFIG = {
     "search": {
         "freshness": "pw",  # pd=past day, pw=past week, pm=past month
         "max_results_per_query": 20,
-        "base_query": "",
         "sites": [],
-        "queries": [],  # legacy: used if base_query + sites are empty
+        "query_templates": [],
     },
     "candidate_profile": "",
-    "filtering": {"min_score": 60, "borderline_threshold": 40},
+    "filtering": {
+        "min_score": 60,
+        "borderline_threshold": 40,
+        "prefilter": {
+            "enabled": True,
+            "location_keywords": DEFAULT_LOCATION_KEYWORDS,
+            "skip_title_patterns": DEFAULT_SKIP_TITLE_PATTERNS,
+        },
+    },
     "openai": {"model": "gpt-4o-mini"},
     "recipient_email": "",
     "schedule": "0 9 * * *",
@@ -99,16 +113,23 @@ DEFAULT_CONFIG = {
 def load_config():
     db = get_db()
     doc = db.config.find_one({"_id": "main"})
-    if doc:
-        doc.pop("_id", None)
-        return doc
-    return _seed_config()
+    if not doc:
+        return _seed_config()
+    doc.pop("_id", None)
+    # Migrate: drop removed keys, ensure current shape
+    search = doc.get("search") or {}
+    search.pop("base_query", None)
+    search.pop("queries", None)
+    if "query_templates" not in search:
+        search["query_templates"] = []
+    doc["search"] = search
+    return doc
 
 
 def _seed_config():
     """On first run, seed MongoDB from config.yaml if it exists, otherwise use defaults."""
     db = get_db()
-    seed = dict(DEFAULT_CONFIG)
+    seed = {k: v for k, v in DEFAULT_CONFIG.items()}  # shallow copy
 
     if SEED_CONFIG_PATH.exists():
         logger.info("Seeding config from %s", SEED_CONFIG_PATH)
@@ -117,6 +138,10 @@ def _seed_config():
         for key in ("search", "candidate_profile", "filtering", "openai", "recipient_email", "schedule"):
             if key in file_cfg:
                 seed[key] = file_cfg[key]
+
+    # Strip any stale keys from seed
+    seed.get("search", {}).pop("base_query", None)
+    seed.get("search", {}).pop("queries", None)
 
     db.config.replace_one({"_id": "main"}, seed, upsert=True)
     seed.pop("_id", None)
@@ -222,6 +247,7 @@ def save_run(run_record):
 
 # ── Step 1: Build queries ──────────────────────────────────────────────
 
+
 def _site_label(host: str) -> str:
     host = (host or "").strip().lower().replace("www.", "")
     parts = host.split(".")
@@ -230,18 +256,21 @@ def _site_label(host: str) -> str:
 
 def build_queries(config):
     search = config.get("search") or {}
-    base = " ".join((search.get("base_query") or "").split())
     sites = [str(s).strip() for s in (search.get("sites") or []) if str(s).strip()]
-    if base and sites:
-        return [
-            {"name": _site_label(site), "query": f"site:{site} {base}".strip()}
-            for site in sites
-        ]
+    templates = [t for t in (search.get("query_templates") or []) if t.get("query")]
+
     queries = []
-    for q in search.get("queries") or []:
-        rendered = " ".join((q.get("query") or "").split())
-        if rendered:
-            queries.append({"name": q.get("name") or "query", "query": rendered})
+    for tmpl in templates:
+        q = " ".join(tmpl["query"].split())
+        name = tmpl.get("name") or "q"
+        if sites:
+            for site in sites:
+                queries.append({
+                    "name": f"{_site_label(site)}_{name}",
+                    "query": f"site:{site} {q}",
+                })
+        else:
+            queries.append({"name": name, "query": q})
     return queries
 
 
@@ -450,6 +479,54 @@ def fetch_job_page(url, timeout=15):
     except Exception as e:
         logger.warning("Failed to fetch %s: %s", url, e)
         return {"title": "", "text": ""}
+
+
+# ── Step 4b: Pre-filter before AI scoring ─────────────────────────────
+
+
+def pre_filter_jobs(jobs, config=None):
+    """Cheap pre-filter: skip jobs that don't mention target locations and
+    skip seniority titles.  Returns (passed, filtered_out).
+
+    Reads prefilter config from config["filtering"]["prefilter"] if present,
+    otherwise uses defaults."""
+    pf_cfg = {}
+    if config:
+        pf_cfg = (config.get("filtering") or {}).get("prefilter") or {}
+
+    location_keywords = pf_cfg.get("location_keywords", DEFAULT_LOCATION_KEYWORDS)
+    skip_title_patterns = pf_cfg.get("skip_title_patterns", DEFAULT_SKIP_TITLE_PATTERNS)
+    enabled = pf_cfg.get("enabled", True)
+
+    if not enabled:
+        return jobs, []
+
+    # Normalize to lowercase once
+    location_keywords = [kw.lower() for kw in location_keywords]
+    skip_title_patterns = [pat.lower() for pat in skip_title_patterns]
+
+    passed = []
+    filtered = []
+    for job in jobs:
+        title_lower = (job.get("title") or "").lower()
+        text_lower = (job.get("text") or "").lower()
+
+        # Title-based seniority filter
+        if any(pat in title_lower for pat in skip_title_patterns):
+            job["_prefilter_reason"] = "title contains seniority keyword"
+            filtered.append(job)
+            continue
+
+        # Location keyword check (title + body)
+        combined = title_lower + " " + text_lower
+        if not any(kw in combined for kw in location_keywords):
+            job["_prefilter_reason"] = "no location keyword found in page"
+            filtered.append(job)
+            continue
+
+        passed.append(job)
+
+    return passed, filtered
 
 
 # ── Step 5: OpenAI scoring ─────────────────────────────────────────────
@@ -707,6 +784,8 @@ def run(on_progress=None):
         "stages": {},
         "jobs_found": 0,
         "jobs_new": 0,
+        "jobs_prefilter_passed": 0,
+        "jobs_prefilter_skipped": 0,
         "jobs_scored": 0,
         "jobs_matched": 0,
         "jobs_borderline": 0,
@@ -764,9 +843,31 @@ def run(on_progress=None):
         with ThreadPoolExecutor(max_workers=5) as pool:
             list(pool.map(_fetch_and_attach, new_results))
 
+        # Step 4b: Pre-filter
+        progress("prefilter", f"Pre-filtering {len(new_results)} jobs")
+        pf_passed, pf_skipped = pre_filter_jobs(new_results, config)
+        run_record["jobs_prefilter_passed"] = len(pf_passed)
+        run_record["jobs_prefilter_skipped"] = len(pf_skipped)
+        logger.info(
+            "Pre-filter: %d passed, %d skipped (of %d fetched)",
+            len(pf_passed), len(pf_skipped), len(new_results),
+        )
+        for j in pf_skipped:
+            logger.info("  Skipped: %s — %s", j.get("title", "?")[:50], j.get("_prefilter_reason", ""))
+        progress("prefilter", f"{len(pf_passed)} passed, {len(pf_skipped)} skipped")
+
+        if not pf_passed:
+            # Still mark all as seen so they aren't re-fetched
+            mark_jobs_seen(new_results)
+            run_record["status"] = "completed"
+            progress("done", "All jobs filtered out by pre-filter")
+            save_run(run_record)
+            send_ntfy(freshness, 0, "")
+            return run_record
+
         # Step 5: Score
-        progress("score", f"Scoring {len(new_results)} jobs with OpenAI")
-        all_scored, matched, borderline = score_jobs(config, new_results)
+        progress("score", f"Scoring {len(pf_passed)} jobs with OpenAI")
+        all_scored, matched, borderline = score_jobs(config, pf_passed)
         run_record["jobs_scored"] = len(all_scored)
         run_record["jobs_matched"] = len(matched)
         run_record["jobs_borderline"] = len(borderline)
@@ -778,7 +879,8 @@ def run(on_progress=None):
         run_record["borderline_jobs"] = serializable(borderline)
         run_record["all_scored_jobs"] = serializable(all_scored)
 
-        mark_jobs_seen(all_scored, all_scored)
+        # Mark scored jobs with scores, and pre-filtered jobs as seen (no score)
+        mark_jobs_seen(all_scored + pf_skipped, all_scored)
 
         # Step 6: Email
         if matched or borderline:
@@ -791,7 +893,15 @@ def run(on_progress=None):
         send_ntfy(freshness, total_matched, recipient)
 
         run_record["status"] = "completed"
-        progress("done", f"Done — {len(matched)} matched, {len(borderline)} borderline")
+        pipeline_summary = (
+            f"Pipeline: {run_record['jobs_found']} found → "
+            f"{run_record['jobs_new']} new → "
+            f"{run_record['jobs_prefilter_passed']} survived pre-filter → "
+            f"{run_record['jobs_scored']} scored → "
+            f"{len(matched)} matched, {len(borderline)} borderline"
+        )
+        logger.info(pipeline_summary)
+        progress("done", pipeline_summary)
 
     except Exception as e:
         logger.exception("Run failed")

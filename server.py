@@ -1,4 +1,3 @@
-import copy
 import logging
 import os
 import secrets
@@ -336,32 +335,13 @@ def _validate_config_updates(updates):
     return errors
 
 
-def _redact(value):
-    if not value or len(value) < 6:
-        return "***"
-    return value[:3] + "•" * (len(value) - 6) + value[-3:]
-
-
-def _enrich_config_for_api(config):
-    """Add env-sourced secrets (redacted) into config for the API response."""
-    c = copy.deepcopy(config)
-    c["openai"]["api_key"] = _redact(os.environ.get("OPENAI_API_KEY", ""))
-    icloud_email = os.environ.get("ICLOUD_EMAIL", "")
-    sender_mail = os.environ.get("SENDER_MAIL", "").strip() or icloud_email
-    c["env_secrets"] = {
-        "brave_api_key": _redact(os.environ.get("BRAVE_API_KEY", "")),
-        "icloud_email": _redact(icloud_email),
-        "sender_mail": _redact(sender_mail),
-        "app_specific_password": "••••-••••-••••-••••",
-    }
-    return c
 
 
 @app.route("/api/config")
 @login_required
 def api_get_config():
     config = job_scout.load_config()
-    return jsonify(_enrich_config_for_api(config))
+    return jsonify(config)
 
 
 @app.route("/api/config", methods=["PUT"])
@@ -375,11 +355,11 @@ def api_update_config():
         return jsonify({"error": "Validation failed", "details": errors}), 400
 
     if "search" in updates:
-        current["search"] = updates["search"]
+        current["search"] = {**current.get("search", {}), **updates["search"]}
     if "candidate_profile" in updates:
         current["candidate_profile"] = updates["candidate_profile"]
     if "filtering" in updates:
-        current["filtering"] = updates["filtering"]
+        current["filtering"] = {**current.get("filtering", {}), **updates["filtering"]}
     if "openai" in updates:
         if "model" in updates["openai"]:
             current["openai"]["model"] = updates["openai"]["model"]
