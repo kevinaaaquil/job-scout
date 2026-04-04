@@ -56,7 +56,7 @@
     <label>Username</label>
     <input type="text" id="username" autocomplete="username" required autofocus>
     <label>Password</label>
-    <div style="position:relative;">
+    <div class="pw-field" style="position:relative;">
       <input type="password" id="password" autocomplete="current-password" required style="padding-right:44px;margin-bottom:16px;">
       <button type="button" id="togglePw" style="position:absolute;right:8px;top:6px;width:auto;padding:4px 8px;background:var(--border);font-size:0.75rem;border-radius:4px;">Show</button>
     </div>
@@ -64,6 +64,26 @@
   </form>
 </div>
 <script>
+const loginForm = document.getElementById('loginForm');
+const usernameEl = document.getElementById('username');
+const passwordEl = document.getElementById('password');
+
+usernameEl.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  passwordEl.focus();
+});
+
+passwordEl.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  if (typeof loginForm.requestSubmit === 'function') {
+    loginForm.requestSubmit();
+  } else {
+    document.getElementById('submitBtn').click();
+  }
+});
+
 document.getElementById('togglePw').addEventListener('click', () => {
   const pw = document.getElementById('password');
   const btn = document.getElementById('togglePw');
@@ -72,7 +92,7 @@ document.getElementById('togglePw').addEventListener('click', () => {
   btn.textContent = show ? 'Hide' : 'Show';
 });
 
-document.getElementById('loginForm').addEventListener('submit', async (e) => {
+loginForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const btn = document.getElementById('submitBtn');
   const err = document.getElementById('error');
