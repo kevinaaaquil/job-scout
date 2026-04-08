@@ -1,5 +1,10 @@
+user_email: "eshansingh2409@gmail.com"
+user_password: "dream-like-me"
+
 search:
-  freshness: "pw"  # pd=past day, pw=past week, pm=past month, py=past year
+  freshness: "pm"  # pd=past day, pw=past week, pm=past month, py=past year
+  country: "IN"    # Brave country code (ISO 3166-1 alpha-2)
+  ui_lang: "en-IN" # Brave host language
   max_results_per_query: 20
   base_query: >
     ("Software Engineer" OR "Backend Engineer" OR "SDE" OR "Backend Developer" OR "Software Developer")  India

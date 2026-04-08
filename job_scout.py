@@ -14,6 +14,7 @@ from pathlib import Path
 import requests
 import yaml
 from bs4 import BeautifulSoup
+from enums import RunStatus, Freshness
 from openai import OpenAI, APIConnectionError, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -50,14 +51,16 @@ ROLE & DOMAIN FIT (0-25 points):
 
 LOCATION MATCH (0-25 points):
   - Is the job in one of the candidate's target locations, or remote-friendly?
+  - HARD DISQUALIFIER: If the candidate cannot serve the job's location (wrong country, requires relocation to an excluded area, on-site only in a city not in the candidate's list), set location score to 0 and add a disqualifier. This is non-negotiable regardless of how well the rest of the profile matches.
 
 FLEXIBILITY (important):
   - Be fair when the role is slightly broader than the candidate's label (e.g. "fullstack" job that is mostly backend/infrastructure — strong backend with some adjacent frontend or API exposure can score well on role fit and tech stack if frontend is not the majority of the role).
   - Reward transferable skills and partial stack overlap; only use harsh penalties when the mismatch is central to the job.
+  - Location flexibility does NOT apply — a location mismatch is always a hard disqualifier.
 
 DISQUALIFIER RULES (check the candidate profile for specific criteria):
   - Add disqualifier if the job requires significantly more YOE than the candidate has
-  - Add disqualifier if the role is in a location the candidate cannot work from
+  - HARD: Add disqualifier if the role is in a location the candidate cannot work from — this alone should tank the score regardless of other matches
   - Add disqualifier if the primary tech stack has zero overlap with the candidate's skills
 
 Return a JSON object with exactly this shape:
@@ -78,9 +81,12 @@ EXAMPLE with disqualifier:
 Only return the JSON, no other text."""
 
 DEFAULT_CONFIG = {
-    "_id": "main",
+    "email": "",
+    "run_status": RunStatus.STOPPED,
     "search": {
-        "freshness": "pw",  # pd=past day, pw=past week, pm=past month
+        "freshness": Freshness.PAST_WEEK,
+        "country": "IN",
+        "ui_lang": "en-IN",
         "max_results_per_query": 20,
         "base_query": "",
         "sites": [],
@@ -96,38 +102,57 @@ DEFAULT_CONFIG = {
 
 # ── Config (MongoDB) ──────────────────────────────────────────────────
 
-def load_config():
+def load_config(email):
+    """Load config for a specific user by email."""
     db = get_db()
-    doc = db.config.find_one({"_id": "main"})
-    if doc:
+    doc = db.config.find_one({"email": email})
+    if not doc:
+        return None
+    doc.pop("_id", None)
+    search = doc.get("search") or {}
+    if "query_templates" not in search:
+        search["query_templates"] = []
+    doc["search"] = search
+    return doc
+
+
+def load_all_running_configs():
+    """Return all configs with run_status='running'."""
+    db = get_db()
+    docs = list(db.config.find({"run_status": RunStatus.RUNNING}))
+    for doc in docs:
         doc.pop("_id", None)
-        return doc
-    return _seed_config()
+    return docs
 
 
-def _seed_config():
-    """On first run, seed MongoDB from config.yaml if it exists, otherwise use defaults."""
+def seed_config(email):
+    """Create initial config for a user from config.yaml defaults."""
     db = get_db()
-    seed = dict(DEFAULT_CONFIG)
+    if db.config.find_one({"email": email}):
+        return load_config(email)
+
+    seed = {k: v for k, v in DEFAULT_CONFIG.items()}
+    seed["email"] = email
 
     if SEED_CONFIG_PATH.exists():
-        logger.info("Seeding config from %s", SEED_CONFIG_PATH)
+        logger.info("Seeding config from %s for %s", SEED_CONFIG_PATH, email)
         with open(SEED_CONFIG_PATH) as f:
             file_cfg = yaml.safe_load(f) or {}
         for key in ("search", "candidate_profile", "filtering", "openai", "recipient_email", "schedule"):
             if key in file_cfg:
                 seed[key] = file_cfg[key]
 
-    db.config.replace_one({"_id": "main"}, seed, upsert=True)
+    db.config.insert_one(seed)
     seed.pop("_id", None)
     return seed
+
 
 
 def save_config(config):
     db = get_db()
     doc = dict(config)
-    doc["_id"] = "main"
-    db.config.replace_one({"_id": "main"}, doc, upsert=True)
+    email = doc["email"]
+    db.config.replace_one({"email": email}, doc, upsert=True)
 
 
 # ── Seen jobs (MongoDB) ───────────────────────────────────────────────
@@ -234,7 +259,7 @@ def build_queries(config):
     sites = [str(s).strip() for s in (search.get("sites") or []) if str(s).strip()]
     if base and sites:
         return [
-            {"name": _site_label(site), "query": f"site:{site} {base}".strip()}
+            {"name": _site_label(site), "query": f"site:{site} {base}"}
             for site in sites
         ]
     queries = []
@@ -292,7 +317,7 @@ BRAVE_TIMEOUT = 25
     retry=retry_if_exception_type((requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
     reraise=True,
 )
-def _brave_search(query, api_key, freshness, max_results=20):
+def _brave_search(query, api_key, freshness, max_results=20, country="IN", ui_lang="en-IN"):
     """Single Brave Search API call (max 20 results per request).
 
     Returns (results, error_message). Each result is {"url": ..., "title": ...}.
@@ -305,6 +330,8 @@ def _brave_search(query, api_key, freshness, max_results=20):
     params = {
         "q": query,
         "count": min(20, max_results),
+        "country": country,
+        "ui_lang": ui_lang,
     }
     if freshness:
         params["freshness"] = freshness
@@ -332,7 +359,7 @@ def _brave_search(query, api_key, freshness, max_results=20):
     return results, None
 
 
-def run_searches(queries, max_results, freshness="pw"):
+def run_searches(queries, max_results, freshness=Freshness.PAST_WEEK, country="IN", ui_lang="en-IN"):
     api_key = os.environ.get("BRAVE_API_KEY", "")
     if not api_key:
         raise RuntimeError("BRAVE_API_KEY environment variable is required")
@@ -341,7 +368,7 @@ def run_searches(queries, max_results, freshness="pw"):
     for i, q in enumerate(queries):
         logger.info("Searching [%s]:\n  %s", q["name"], q["query"])
         try:
-            results, err = _brave_search(q["query"], api_key, freshness, max_results)
+            results, err = _brave_search(q["query"], api_key, freshness, max_results, country, ui_lang)
             for r in results:
                 all_results.append({"url": r["url"], "title": r.get("title", ""), "source": q["name"]})
             logger.info("  Found %d results for %s", len(results), q["name"])
@@ -356,14 +383,14 @@ def run_searches(queries, max_results, freshness="pw"):
     return all_results
 
 
-def test_search(query_text, max_results=5, freshness="pw"):
+def test_search(query_text, max_results=5, freshness=Freshness.PAST_WEEK, country="IN", ui_lang="en-IN"):
     """Run a single search via Brave API and return raw results for debugging."""
     api_key = os.environ.get("BRAVE_API_KEY", "")
     if not api_key:
         return {"query": query_text, "count": 0, "urls": [], "error": "BRAVE_API_KEY not set"}
     logger.info("Test search: %s", query_text)
     try:
-        results, err = _brave_search(query_text, api_key, freshness, max_results)
+        results, err = _brave_search(query_text, api_key, freshness, max_results, country, ui_lang)
         return {
             "query": query_text,
             "count": len(results),
@@ -625,7 +652,12 @@ def send_email(recipient, matched, borderline):
     html = build_email_html(matched, borderline)
 
     msg = EmailMessage()
-    msg["Subject"] = f"Job Scout: {len(matched)} new match{'es' if len(matched) != 1 else ''} found"
+    parts = []
+    if matched:
+        parts.append(f"{len(matched)} match{'es' if len(matched) != 1 else ''}")
+    if borderline:
+        parts.append(f"{len(borderline)} borderline")
+    msg["Subject"] = f"Job Scout: {', '.join(parts)} found"
     msg["From"] = sender_mail
     msg["To"] = recipient
     msg.add_alternative(html, subtype="html")
@@ -660,10 +692,10 @@ def send_email(recipient, matched, borderline):
 # ── Step 7: Ntfy notification ──────────────────────────────────────────
 
 FRESHNESS_LABELS = {
-    "pd": "past day",
-    "pw": "past week",
-    "pm": "past month",
-    "py": "past year",
+    Freshness.PAST_DAY: "past day",
+    Freshness.PAST_WEEK: "past week",
+    Freshness.PAST_MONTH: "past month",
+    Freshness.PAST_YEAR: "past year",
 }
 
 
@@ -697,8 +729,8 @@ def send_ntfy(freshness, matched_count, recipient):
 
 # ── Main run orchestrator ──────────────────────────────────────────────
 
-def run(on_progress=None):
-    """Execute a full job scout run. Returns the run record dict."""
+def run(email, on_progress=None):
+    """Execute a full job scout run for a specific user. Returns the run record dict."""
     run_id = uuid.uuid4().hex[:12]
     run_record = {
         "id": run_id,
@@ -723,9 +755,13 @@ def run(on_progress=None):
             on_progress(stage, detail)
 
     try:
-        config = load_config()
+        config = load_config(email)
+        if not config:
+            raise RuntimeError(f"No config found for {email}")
         recipient = config.get("recipient_email", "")
-        freshness = config["search"].get("freshness", "pw")
+        freshness = config["search"].get("freshness", Freshness.PAST_WEEK)
+        country = config["search"].get("country", "IN")
+        ui_lang = config["search"].get("ui_lang", "en-IN")
 
         # Step 1: Build queries
         progress("queries", "Building search queries")
@@ -734,7 +770,7 @@ def run(on_progress=None):
         # Step 2: Search
         progress("search", f"Searching {len(queries)} sites")
         max_results = config["search"].get("max_results_per_query", 20)
-        all_results = run_searches(queries, max_results, freshness)
+        all_results = run_searches(queries, max_results, freshness, country, ui_lang)
         run_record["jobs_found"] = len(all_results)
         progress("search", f"Found {len(all_results)} total results")
 

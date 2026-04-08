@@ -58,7 +58,9 @@ def recipient_from_mongo() -> str | None:
     try:
         import job_scout
 
-        return (job_scout.load_config().get("recipient_email") or "").strip() or None
+        email = os.environ.get("TEST_USER_EMAIL", "eshansingh2409@gmail.com")
+        config = job_scout.load_config(email)
+        return (config.get("recipient_email") or "").strip() if config else None
     except Exception as e:
         print(f"Could not load recipient_email from MongoDB: {e}", file=sys.stderr)
         return None

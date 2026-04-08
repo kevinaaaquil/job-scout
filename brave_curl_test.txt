@@ -1,0 +1,94 @@
+# Brave Search API - curl test strategies
+# Replace YOUR_BRAVE_API_KEY with your actual key
+# Pipe through: | python3 -m json.tool
+# Or use in Postman — just copy the URL + headers + params
+
+# ============================================================
+# STRATEGY A: Current query (broken — Brave strips OR + quotes)
+# ============================================================
+# Brave cleaned: ("Software Engineer" Backend Engineer SDE Backend Developer Software Developer ) India
+# Only first quoted phrase survives. Rest become loose words.
+
+curl -s -G "https://api.search.brave.com/res/v1/web/search" \
+  -H "X-Subscription-Token: YOUR_BRAVE_API_KEY" \
+  -H "Accept: application/json" \
+  --data-urlencode 'q=site:boards.greenhouse.io ("Software Engineer" OR "Backend Engineer" OR "SDE" OR "Backend Developer" OR "Software Developer") India' \
+  --data-urlencode "count=20" \
+  --data-urlencode "country=IN" \
+  --data-urlencode "ui_lang=en-IN" \
+  --data-urlencode "freshness=pm"
+
+# ============================================================
+# STRATEGY B: One quoted phrase per query (most precise)
+# ============================================================
+# Split each title into its own call. Brave handles single
+# quoted phrase + site: cleanly.
+
+curl -s -G "https://api.search.brave.com/res/v1/web/search" \
+  -H "X-Subscription-Token: YOUR_BRAVE_API_KEY" \
+  -H "Accept: application/json" \
+  --data-urlencode 'q=site:boards.greenhouse.io "Software Engineer" India' \
+  --data-urlencode "count=20" \
+  --data-urlencode "country=IN" \
+  --data-urlencode "ui_lang=en-IN" \
+  --data-urlencode "freshness=pm"
+
+curl -s -G "https://api.search.brave.com/res/v1/web/search" \
+  -H "X-Subscription-Token: YOUR_BRAVE_API_KEY" \
+  -H "Accept: application/json" \
+  --data-urlencode 'q=site:boards.greenhouse.io "Backend Engineer" India' \
+  --data-urlencode "count=20" \
+  --data-urlencode "country=IN" \
+  --data-urlencode "ui_lang=en-IN" \
+  --data-urlencode "freshness=pm"
+
+curl -s -G "https://api.search.brave.com/res/v1/web/search" \
+  -H "X-Subscription-Token: YOUR_BRAVE_API_KEY" \
+  -H "Accept: application/json" \
+  --data-urlencode 'q=site:boards.greenhouse.io "SDE" India' \
+  --data-urlencode "count=20" \
+  --data-urlencode "country=IN" \
+  --data-urlencode "ui_lang=en-IN" \
+  --data-urlencode "freshness=pm"
+
+# ============================================================
+# STRATEGY C: No parentheses, just OR between quoted phrases
+# ============================================================
+# Some search engines handle OR better without parens.
+
+curl -s -G "https://api.search.brave.com/res/v1/web/search" \
+  -H "X-Subscription-Token: YOUR_BRAVE_API_KEY" \
+  -H "Accept: application/json" \
+  --data-urlencode 'q=site:boards.greenhouse.io "Software Engineer" OR "Backend Engineer" OR "SDE" India' \
+  --data-urlencode "count=20" \
+  --data-urlencode "country=IN" \
+  --data-urlencode "ui_lang=en-IN" \
+  --data-urlencode "freshness=pm"
+
+# ============================================================
+# STRATEGY D: intitle: operator (if Brave supports it)
+# ============================================================
+# Forces title matching — much more precise for job boards.
+
+curl -s -G "https://api.search.brave.com/res/v1/web/search" \
+  -H "X-Subscription-Token: YOUR_BRAVE_API_KEY" \
+  -H "Accept: application/json" \
+  --data-urlencode 'q=site:boards.greenhouse.io intitle:"Software Engineer" India' \
+  --data-urlencode "count=20" \
+  --data-urlencode "country=IN" \
+  --data-urlencode "ui_lang=en-IN" \
+  --data-urlencode "freshness=pm"
+
+# ============================================================
+# STRATEGY E: Simple keywords, no boolean
+# ============================================================
+# Let Brave's ranking do the work. Less precise but no parser issues.
+
+curl -s -G "https://api.search.brave.com/res/v1/web/search" \
+  -H "X-Subscription-Token: YOUR_BRAVE_API_KEY" \
+  -H "Accept: application/json" \
+  --data-urlencode 'q=site:boards.greenhouse.io software engineer backend India' \
+  --data-urlencode "count=20" \
+  --data-urlencode "country=IN" \
+  --data-urlencode "ui_lang=en-IN" \
+  --data-urlencode "freshness=pm"

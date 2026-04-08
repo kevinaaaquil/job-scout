@@ -9,15 +9,21 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import Flask, jsonify, request, send_from_directory, session
+import bcrypt
+
+from pathlib import Path
+
+import yaml
 
 import job_scout
 from db import get_db
+from enums import UserPrivilege, RunStatus, Freshness
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger("server")
 
-# Plain-text passwords (MongoDB + .env) for now; hashing later.
-ADMIN_USERS_COLLECTION = "admin_users"
+# Passwords are stored hashed (bcrypt).
+USERS_COLLECTION = "users"
 
 APP_TZ = ZoneInfo(os.environ.get("TZ", "Asia/Kolkata"))
 
@@ -25,23 +31,44 @@ app = Flask(__name__, static_folder="static")
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 scheduler = BackgroundScheduler(daemon=True, timezone=APP_TZ)
 
-JOB_ID = "job_scout_daily"
-_current_run_lock = threading.Lock()
-_current_run_status = {"running": False, "stage": "", "detail": ""}
+_run_locks = {}  # email -> threading.Lock
+_run_statuses = {}  # email -> {"running": bool, "stage": str, "detail": str}
+
+def _get_run_state(email):
+    if email not in _run_locks:
+        _run_locks[email] = threading.Lock()
+        _run_statuses[email] = {"running": False, "stage": "", "detail": ""}
+    return _run_locks[email], _run_statuses[email]
+
+def _job_id(email):
+    return f"job_scout_{email}"
 
 # ── Auth ──────────────────────────────────────────────────────────────
 
-ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+
+
+def _ensure_users_collection():
+    """Create unique index on email in users collection."""
+    col = get_db()[USERS_COLLECTION]
+    col.create_index("email", unique=True, sparse=True)
+
+
+def ensure_user(email, password, privilege=UserPrivilege.GUEST):
+    """Create a user with a bcrypt-hashed password if they don't already exist."""
+    col = get_db()[USERS_COLLECTION]
+    if not col.find_one({"email": email}):
+        hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        col.insert_one({"email": email, "password": hashed, "privilege": privilege})
+        logger.info("Created user: %s (privilege: %s)", email, privilege)
 
 
 def _mongo_has_login_users():
     try:
-        col = get_db()[ADMIN_USERS_COLLECTION]
+        col = get_db()[USERS_COLLECTION]
         return (
             col.count_documents(
                 {
-                    "username": {"$exists": True, "$nin": [None, ""]},
+                    "email": {"$exists": True, "$nin": [None, ""]},
                     "password": {"$exists": True, "$nin": [None, ""]},
                 },
                 limit=1,
@@ -49,27 +76,35 @@ def _mongo_has_login_users():
             > 0
         )
     except Exception as exc:
-        logger.warning("MongoDB admin user check failed: %s", exc)
+        logger.warning("MongoDB user check failed: %s", exc)
         return False
 
 
 def _auth_enabled():
-    return bool(ADMIN_PASSWORD) or _mongo_has_login_users()
+    return _mongo_has_login_users()
 
 
-def _credentials_valid(username, password):
-    """MongoDB first (plain password on user doc). If no matching Mongo user, fall back to .env."""
+def _credentials_valid(email, password):
+    """Check hashed password from MongoDB users collection."""
     try:
-        doc = get_db()[ADMIN_USERS_COLLECTION].find_one({"username": username})
+        doc = get_db()[USERS_COLLECTION].find_one({"email": email})
         if doc is not None:
             stored = doc.get("password") or ""
-            return stored == password
+            return bcrypt.checkpw(password.encode(), stored.encode())
     except Exception as exc:
         logger.warning("MongoDB login lookup failed: %s", exc)
-
-    if ADMIN_PASSWORD and username == ADMIN_USER:
-        return ADMIN_PASSWORD == password
     return False
+
+
+def _get_user_privilege(email):
+    """Return the privilege level for a user. Defaults to 'guest'."""
+    try:
+        doc = get_db()[USERS_COLLECTION].find_one({"email": email})
+        if doc:
+            return doc.get("privilege", UserPrivilege.GUEST)
+    except Exception:
+        pass
+    return UserPrivilege.GUEST
 
 
 def login_required(f):
@@ -85,47 +120,71 @@ def login_required(f):
     return decorated
 
 
+def config_required(f):
+    """Load user config and pass as first arg. Returns 404 if no config exists."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        email = session.get("email")
+        if not email:
+            return jsonify({"error": "No user session"}), 401
+        config = job_scout.load_config(email)
+        if not config:
+            return jsonify({"error": "No config found"}), 404
+        return f(config, *args, **kwargs)
+    return decorated
+
+
 # ── Scheduler helpers ──────────────────────────────────────────────────
 
-def _execute_run():
-    with _current_run_lock:
-        if _current_run_status["running"]:
-            logger.warning("Run already in progress, skipping")
+def _execute_run(email):
+    lock, status = _get_run_state(email)
+    with lock:
+        if status["running"]:
+            logger.warning("Run already in progress for %s, skipping", email)
             return None
-        _current_run_status["running"] = True
-        _current_run_status["stage"] = "starting"
-        _current_run_status["detail"] = ""
+        status["running"] = True
+        status["stage"] = "starting"
+        status["detail"] = ""
 
     def on_progress(stage, detail):
-        with _current_run_lock:
-            _current_run_status["stage"] = stage
-            _current_run_status["detail"] = detail
+        with lock:
+            status["stage"] = stage
+            status["detail"] = detail
 
     try:
-        result = job_scout.run(on_progress=on_progress)
+        result = job_scout.run(email, on_progress=on_progress)
         return result
     finally:
-        with _current_run_lock:
-            _current_run_status["running"] = False
-            _current_run_status["stage"] = "idle"
-            _current_run_status["detail"] = ""
+        with lock:
+            status["running"] = False
+            status["stage"] = "idle"
+            status["detail"] = ""
 
 
-def _reschedule(cron_expr):
-    if scheduler.get_job(JOB_ID):
-        scheduler.remove_job(JOB_ID)
+def _schedule_user(email, cron_expr):
+    job_id = _job_id(email)
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
     scheduler.add_job(
         _execute_run,
         CronTrigger.from_crontab(cron_expr),
-        id=JOB_ID,
-        name="Job Scout Daily Run",
+        args=[email],
+        id=job_id,
+        name=f"Job Scout: {email}",
         replace_existing=True,
     )
-    logger.info("Scheduled job with cron: %s", cron_expr)
+    logger.info("Scheduled job for %s with cron: %s", email, cron_expr)
 
 
-def _get_next_run():
-    job = scheduler.get_job(JOB_ID)
+def _unschedule_user(email):
+    job_id = _job_id(email)
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+        logger.info("Unscheduled job for %s", email)
+
+
+def _get_next_run(email):
+    job = scheduler.get_job(_job_id(email))
     if job and job.next_run_time:
         return job.next_run_time.isoformat()
     return None
@@ -136,13 +195,15 @@ def _get_next_run():
 @app.route("/api/login", methods=["POST"])
 def api_login():
     data = request.get_json() or {}
-    user = data.get("username", "")
+    email = data.get("email", "")
     pw = data.get("password", "")
     if not _auth_enabled():
         session["authed"] = True
         return jsonify({"message": "OK"})
-    if _credentials_valid(user, pw):
+    if _credentials_valid(email, pw):
         session["authed"] = True
+        session["email"] = email
+        session["privilege"] = _get_user_privilege(email)
         return jsonify({"message": "OK"})
     return jsonify({"error": "Invalid credentials"}), 401
 
@@ -165,17 +226,22 @@ def index():
 
 @app.route("/api/status")
 @login_required
-def api_status():
+@config_required
+def api_status(config):
+    email = config["email"]
     history = job_scout.load_run_history()
     last_run = history[0] if history else None
 
-    with _current_run_lock:
-        running = _current_run_status["running"]
-        stage = _current_run_status["stage"]
-        detail = _current_run_status["detail"]
+    lock, status = _get_run_state(email)
+    with lock:
+        running = status["running"]
+        stage = status["stage"]
+        detail = status["detail"]
 
     return jsonify({
-        "next_run": _get_next_run(),
+        "run_status": config.get("run_status", RunStatus.STOPPED),
+        "schedule": config.get("schedule", ""),
+        "next_run": _get_next_run(email),
         "last_run": {
             "timestamp": last_run["timestamp"],
             "status": last_run["status"],
@@ -221,13 +287,46 @@ def api_run_detail(run_id):
 @app.route("/api/run", methods=["POST"])
 @login_required
 def api_trigger_run():
-    with _current_run_lock:
-        if _current_run_status["running"]:
+    email = session.get("email")
+    if not email:
+        return jsonify({"error": "No user session"}), 401
+    lock, status = _get_run_state(email)
+    with lock:
+        if status["running"]:
             return jsonify({"error": "A run is already in progress"}), 409
 
-    thread = threading.Thread(target=_execute_run, daemon=True)
+    thread = threading.Thread(target=_execute_run, args=[email], daemon=True)
     thread.start()
     return jsonify({"message": "Run triggered", "status": "started"})
+
+
+@app.route("/api/script/start", methods=["POST"])
+@login_required
+@config_required
+def api_script_start(config):
+    email = config["email"]
+    if config.get("run_status") == RunStatus.RUNNING:
+        return jsonify({"error": "Script is already running"}), 409
+
+    cron_expr = config.get("schedule", "0 9 * * *")
+    config["run_status"] = RunStatus.RUNNING
+    job_scout.save_config(config)
+    _schedule_user(email, cron_expr)
+    return jsonify({"message": "Script started", "next_run": _get_next_run(email)})
+
+
+@app.route("/api/script/stop", methods=["POST"])
+@login_required
+@config_required
+def api_script_stop(config):
+    email = config["email"]
+    if config.get("run_status") == RunStatus.STOPPED:
+        return jsonify({"error": "Script is already stopped"}), 409
+
+    config["run_status"] = RunStatus.STOPPED
+    job_scout.save_config(config)
+    _unschedule_user(email)
+    return jsonify({"message": "Script stopped"})
 
 
 # ── Routes: Debug ──────────────────────────────────────────────────────
@@ -247,9 +346,9 @@ def api_debug_search():
 
 @app.route("/api/debug/queries")
 @login_required
-def api_debug_queries():
+@config_required
+def api_debug_queries(config):
     """Show the fully rendered queries that would be used in a run."""
-    config = job_scout.load_config()
     queries = job_scout.build_queries(config)
     return jsonify(queries)
 
@@ -273,8 +372,8 @@ def _validate_config_updates(updates):
         if not isinstance(s, dict):
             errors.append("search must be an object")
         else:
-            if "freshness" in s and s["freshness"] not in ("", "pd", "pw", "pm", "py"):
-                errors.append("search.freshness must be one of: pd, pw, pm, py, or empty")
+            if "freshness" in s and s["freshness"] not in Freshness:
+                errors.append(f"search.freshness must be one of: {', '.join(f.value for f in Freshness)}")
             if "max_results_per_query" in s:
                 try:
                     v = int(s["max_results_per_query"])
@@ -360,14 +459,22 @@ def _enrich_config_for_api(config):
 @app.route("/api/config")
 @login_required
 def api_get_config():
-    config = job_scout.load_config()
+    email = session.get("email")
+    if not email:
+        return jsonify({"error": "No user session"}), 401
+    config = job_scout.load_config(email)
+    if not config:
+        config = job_scout.seed_config(email)
     return jsonify(_enrich_config_for_api(config))
 
 
 @app.route("/api/config", methods=["PUT"])
 @login_required
-def api_update_config():
-    current = job_scout.load_config()
+@config_required
+def api_update_config(config):
+    if config.get("run_status") == RunStatus.RUNNING:
+        return jsonify({"error": "Stop the script before editing config"}), 409
+
     updates = request.get_json()
 
     errors = _validate_config_updates(updates)
@@ -375,37 +482,40 @@ def api_update_config():
         return jsonify({"error": "Validation failed", "details": errors}), 400
 
     if "search" in updates:
-        current["search"] = updates["search"]
+        config["search"] = updates["search"]
     if "candidate_profile" in updates:
-        current["candidate_profile"] = updates["candidate_profile"]
+        config["candidate_profile"] = updates["candidate_profile"]
     if "filtering" in updates:
-        current["filtering"] = updates["filtering"]
+        config["filtering"] = updates["filtering"]
     if "openai" in updates:
         if "model" in updates["openai"]:
-            current["openai"]["model"] = updates["openai"]["model"]
+            config["openai"]["model"] = updates["openai"]["model"]
     if "recipient_email" in updates:
-        current["recipient_email"] = updates["recipient_email"]
+        config["recipient_email"] = updates["recipient_email"]
     if "schedule" in updates:
-        current["schedule"] = updates["schedule"]
-        _reschedule(updates["schedule"])
+        config["schedule"] = updates["schedule"]
 
-    job_scout.save_config(current)
-    return jsonify({"message": "Config updated", "config": _enrich_config_for_api(current)})
+    job_scout.save_config(config)
+    return jsonify({"message": "Config updated", "config": config})
 
 
 @app.route("/api/config/schedule")
 @login_required
-def api_get_schedule():
-    config = job_scout.load_config()
+@config_required
+def api_get_schedule(config):
     return jsonify({
         "schedule": config.get("schedule", "0 9 * * *"),
-        "next_run": _get_next_run(),
+        "next_run": _get_next_run(config["email"]),
     })
 
 
 @app.route("/api/config/schedule", methods=["PUT"])
 @login_required
-def api_update_schedule():
+@config_required
+def api_update_schedule(config):
+    if config.get("run_status") == RunStatus.RUNNING:
+        return jsonify({"error": "Stop the script before editing config"}), 409
+
     data = request.get_json()
     cron_expr = data.get("schedule", "").strip()
     if not cron_expr:
@@ -416,15 +526,13 @@ def api_update_schedule():
     except Exception as e:
         return jsonify({"error": f"Invalid cron expression: {e}"}), 400
 
-    config = job_scout.load_config()
     config["schedule"] = cron_expr
     job_scout.save_config(config)
-    _reschedule(cron_expr)
 
     return jsonify({
         "message": "Schedule updated",
         "schedule": cron_expr,
-        "next_run": _get_next_run(),
+        "next_run": _get_next_run(config["email"]),
     })
 
 
@@ -450,14 +558,35 @@ def api_clear_seen_urls():
 
 # ── Startup ────────────────────────────────────────────────────────────
 
+SEED_CONFIG_PATH = Path(__file__).parent / "config.yaml"
+
+
+def _seed_initial_user():
+    """Seed the initial admin user and config from config.yaml if present."""
+    if not SEED_CONFIG_PATH.exists():
+        return
+    with open(SEED_CONFIG_PATH) as f:
+        file_cfg = yaml.safe_load(f) or {}
+    email = file_cfg.get("user_email")
+    if email:
+        ensure_user(email, file_cfg.get("user_password", ""), UserPrivilege.ADMIN)
+        job_scout.seed_config(email)
+
+
 def main():
-    config = job_scout.load_config()
+    _ensure_users_collection()
     job_scout._ensure_indexes()
-    cron_expr = config.get("schedule", "0 9 * * *")
+    _seed_initial_user()
 
     scheduler.start()
-    _reschedule(cron_expr)
-    logger.info("Server starting. Next run: %s", _get_next_run())
+
+    # Restore schedules for all configs that were running before shutdown
+    running_configs = job_scout.load_all_running_configs()
+    for config in running_configs:
+        email = config["email"]
+        cron_expr = config.get("schedule", "0 9 * * *")
+        _schedule_user(email, cron_expr)
+    logger.info("Restored %d running schedules", len(running_configs))
 
     port = int(os.environ.get("PORT", 6969))
     app.run(host="0.0.0.0", port=port, debug=False)

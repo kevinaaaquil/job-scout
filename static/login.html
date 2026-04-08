@@ -53,8 +53,8 @@
   <p style="font-size:0.8rem;color:var(--text2);margin-bottom:16px;">Don't have credentials? <a href="mailto:me@eshansingh.net?subject=Job%20Scout%20—%20Login%20Request" style="color:var(--accent);text-decoration:none;">Request access</a></p>
   <div class="error" id="error"></div>
   <form id="loginForm">
-    <label>Username</label>
-    <input type="text" id="username" autocomplete="username" required autofocus>
+    <label>Email</label>
+    <input type="email" id="email" autocomplete="email" required autofocus>
     <label>Password</label>
     <div class="pw-field" style="position:relative;">
       <input type="password" id="password" autocomplete="current-password" required style="padding-right:44px;margin-bottom:16px;">
@@ -65,7 +65,7 @@
 </div>
 <script>
 const loginForm = document.getElementById('loginForm');
-const usernameEl = document.getElementById('username');
+const usernameEl = document.getElementById('email');
 const passwordEl = document.getElementById('password');
 
 usernameEl.addEventListener('keydown', (e) => {
@@ -104,7 +104,7 @@ loginForm.addEventListener('submit', async (e) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        username: document.getElementById('username').value,
+        email: document.getElementById('email').value,
         password: document.getElementById('password').value,
       }),
     });

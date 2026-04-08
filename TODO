@@ -1,2 +1,0 @@
-* Need to set location as a disqualifer and not a scoring attribute, falls away from prefrence region should send directly to a disqualifer or maybe as a worth a look based on candidate prefrence
-* reset scoring parameters, since location is not one, find another attribute to score on

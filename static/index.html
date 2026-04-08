@@ -188,8 +188,11 @@
     <div class="status-item" id="statusRunning"></div>
     <div class="status-item" id="statusNext"></div>
     <div class="status-item" id="statusLast"></div>
+    <div class="status-item" id="statusScript"></div>
     <div class="spacer"></div>
-    <button id="runNowBtn" onclick="triggerRun()">Run Now</button>
+    <button id="startBtn" onclick="startScript()" style="display:none;">Start Script</button>
+    <button id="stopBtn" class="secondary danger" onclick="stopScript()" style="display:none;">Stop Script</button>
+    <button id="runNowBtn" onclick="triggerRun()" style="display:none;">Run Now</button>
     <button class="secondary" onclick="logout()">Logout</button>
   </div>
 
@@ -206,7 +209,7 @@
     <div class="card">
       <table>
         <thead>
-          <tr><th>Time</th><th>Status</th><th>Found</th><th>New</th><th>Matched</th><th>Email</th></tr>
+          <tr><th>Time</th><th>Status</th><th>Found</th><th>New</th><th>Matched</th><th>Borderline</th><th>Email</th></tr>
         </thead>
         <tbody id="runsTable"></tbody>
       </table>
@@ -233,7 +236,31 @@
           <option value="pm">Past month</option>
           <option value="py">Past year</option>
         </select>
-        <p style="font-size:0.75rem;color:var(--text2);margin-top:6px;">Maps to Brave API <code style="background:var(--bg);padding:2px 6px;border-radius:4px;">freshness</code> when set.</p>
+      </div>
+      <div class="form-row">
+        <label>Search country</label>
+        <select id="searchCountry">
+          <option value="IN">India</option>
+          <option value="US">United States</option>
+          <option value="GB">United Kingdom</option>
+          <option value="DE">Germany</option>
+          <option value="CA">Canada</option>
+          <option value="AU">Australia</option>
+          <option value="SG">Singapore</option>
+          <option value="">All (no country filter)</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Host language</label>
+        <select id="searchUiLang">
+          <option value="en-IN">English (India)</option>
+          <option value="en-US">English (US)</option>
+          <option value="en-GB">English (UK)</option>
+          <option value="de-DE">German</option>
+          <option value="en-CA">English (Canada)</option>
+          <option value="en-AU">English (Australia)</option>
+          <option value="en-SG">English (Singapore)</option>
+        </select>
       </div>
       <div class="form-row">
         <label>Base query</label>
@@ -364,7 +391,13 @@ async function api(path, opts = {}) {
     window.location.href = '/';
     throw new Error('Unauthorized');
   }
-  return res.json();
+  const data = await res.json();
+  if (!res.ok) {
+    const msg = data.error || `API error ${res.status}`;
+    console.error(`API ${path}:`, msg);
+    throw new Error(msg);
+  }
+  return data;
 }
 
 // ── Status bar ──────────────────────────────────────────────────────
@@ -374,18 +407,33 @@ let statusPoll = null;
 async function refreshStatus() {
   const s = await api('/status');
   const running = s.running;
+  const scriptOn = s.run_status === 'running';
 
+  // Script status
+  if (scriptOn) {
+    $('#statusScript').innerHTML = `<span class="dot dot-green"></span> Script: <strong>Active</strong>`;
+  } else {
+    $('#statusScript').innerHTML = `<span class="dot dot-red"></span> Script: <strong>Stopped</strong>`;
+  }
+
+  // Buttons
+  $('#startBtn').style.display = scriptOn ? 'none' : '';
+  $('#stopBtn').style.display = scriptOn ? '' : 'none';
+  $('#runNowBtn').style.display = '';
+  $('#runNowBtn').disabled = running;
+
+  // Current run status
   if (running) {
     $('#statusRunning').innerHTML = `<span class="dot dot-yellow"></span> <strong>Running</strong> — ${s.current_stage}: ${s.current_detail}`;
-    $('#runNowBtn').disabled = true;
   } else {
     $('#statusRunning').innerHTML = `<span class="dot dot-green"></span> <strong>Idle</strong>`;
-    $('#runNowBtn').disabled = false;
   }
 
   $('#statusNext').innerHTML = s.next_run
     ? `Next run: <strong>${fmtTime(s.next_run)}</strong>`
-    : 'No schedule set';
+    : s.schedule
+      ? `Schedule: <strong>${s.schedule}</strong> (stopped)`
+      : 'No schedule set';
 
   if (s.last_run) {
     const badge = s.last_run.status === 'completed' ? 'badge-green' : 'badge-red';
@@ -419,14 +467,38 @@ async function logout() {
 
 async function triggerRun() {
   $('#runNowBtn').disabled = true;
-  const res = await api('/run', { method: 'POST' });
-  if (res.error) {
-    toast(res.error, true);
+  try {
+    await api('/run', { method: 'POST' });
+    toast('Run triggered');
+    setTimeout(refreshStatus, 1000);
+  } catch (e) {
+    toast(e.message, true);
     $('#runNowBtn').disabled = false;
-    return;
   }
-  toast('Run triggered');
-  setTimeout(refreshStatus, 1000);
+}
+
+async function startScript() {
+  $('#startBtn').disabled = true;
+  try {
+    const res = await api('/script/start', { method: 'POST' });
+    toast(`Script started. Next run: ${res.next_run ? fmtTime(res.next_run) : 'pending'}`);
+    await refreshStatus();
+  } catch (e) {
+    toast(e.message, true);
+  }
+  $('#startBtn').disabled = false;
+}
+
+async function stopScript() {
+  $('#stopBtn').disabled = true;
+  try {
+    await api('/script/stop', { method: 'POST' });
+    toast('Script stopped');
+    await refreshStatus();
+  } catch (e) {
+    toast(e.message, true);
+  }
+  $('#stopBtn').disabled = false;
 }
 
 // ── Runs ────────────────────────────────────────────────────────────
@@ -457,6 +529,7 @@ async function refreshRuns() {
       <td>${r.jobs_found}</td>
       <td>${r.jobs_new}</td>
       <td>${r.jobs_matched}</td>
+      <td>${r.jobs_borderline || 0}</td>
       <td>${emailBadge}</td>
     </tr>`;
   }).join('');
@@ -575,17 +648,11 @@ async function loadQueries() {
   const config = await api('/config');
   const s = config.search || {};
   applyFreshnessToSelect(s.freshness);
-  if (s.base_query || (s.sites && s.sites.length)) {
-    $('#baseQueryInput').value = s.base_query || '';
-    sitesData = (s.sites || []).map(h => ({ host: h }));
-  } else if (s.queries && s.queries.length) {
-    const { base, sites } = parseLegacyQueries(s.queries);
-    $('#baseQueryInput').value = base;
-    sitesData = sites.map(h => ({ host: h }));
-  } else {
-    $('#baseQueryInput').value = '';
-    sitesData = [];
-  }
+  $('#searchCountry').value = s.country || 'IN';
+  $('#searchUiLang').value = s.ui_lang || 'en-IN';
+  $('#baseQueryInput').value = s.base_query || '';
+
+  sitesData = (s.sites || []).map(h => ({ host: h }));
   if (!sitesData.length) sitesData = [{ host: '' }];
   renderSites();
 }
@@ -600,24 +667,32 @@ function collectSitesFromDom() {
 }
 
 async function saveQueries() {
-  const base = $('#baseQueryInput').value.trim();
-  const sites = collectSitesFromDom();
-  const freshness = $('#searchFreshness').value;
-  const config = await api('/config');
-  const search = {
-    ...(config.search || {}),
-    freshness: freshness || '',
-    base_query: base,
-    sites,
-    queries: [],
-  };
-  await api('/config', {
-    method: 'PUT',
-    body: JSON.stringify({ search }),
-  });
-  sitesData = sites.length ? sites.map(h => ({ host: h })) : [{ host: '' }];
-  renderSites();
-  toast('Queries saved');
+  try {
+    const base = $('#baseQueryInput').value.trim();
+    const sites = collectSitesFromDom();
+    const freshness = $('#searchFreshness').value;
+    const country = $('#searchCountry').value;
+    const ui_lang = $('#searchUiLang').value;
+    const config = await api('/config');
+    const search = {
+      ...(config.search || {}),
+      freshness: freshness || '',
+      country: country || '',
+      ui_lang,
+      base_query: base,
+      sites,
+      queries: [],
+    };
+    await api('/config', {
+      method: 'PUT',
+      body: JSON.stringify({ search }),
+    });
+    sitesData = sites.length ? sites.map(h => ({ host: h })) : [{ host: '' }];
+    renderSites();
+    toast('Queries saved');
+  } catch (e) {
+    toast(e.message, true);
+  }
 }
 
 // ── Schedule ────────────────────────────────────────────────────────
@@ -643,13 +718,17 @@ function updateCronPreview() {
 }
 
 async function saveSchedule() {
-  const cron = $('#cronInput').value.trim();
-  await api('/config', {
-    method: 'PUT',
-    body: JSON.stringify({ schedule: cron }),
-  });
-  toast('Schedule saved');
-  refreshStatus();
+  try {
+    const cron = $('#cronInput').value.trim();
+    await api('/config', {
+      method: 'PUT',
+      body: JSON.stringify({ schedule: cron }),
+    });
+    toast('Schedule saved');
+    refreshStatus();
+  } catch (e) {
+    toast(e.message, true);
+  }
 }
 
 // ── Profile ─────────────────────────────────────────────────────────
@@ -662,17 +741,21 @@ async function loadProfile() {
 }
 
 async function saveProfile() {
-  await api('/config', {
-    method: 'PUT',
-    body: JSON.stringify({
-      candidate_profile: $('#profileInput').value,
-      filtering: {
-        min_score: parseInt($('#minScoreInput').value) || 60,
-        borderline_threshold: parseInt($('#borderlineThresholdInput').value) || 40,
-      },
-    }),
-  });
-  toast('Profile saved');
+  try {
+    await api('/config', {
+      method: 'PUT',
+      body: JSON.stringify({
+        candidate_profile: $('#profileInput').value,
+        filtering: {
+          min_score: parseInt($('#minScoreInput').value) || 60,
+          borderline_threshold: parseInt($('#borderlineThresholdInput').value) || 40,
+        },
+      }),
+    });
+    toast('Profile saved');
+  } catch (e) {
+    toast(e.message, true);
+  }
 }
 
 // ── Settings ────────────────────────────────────────────────────────
@@ -695,11 +778,15 @@ async function clearSeen() {
 }
 
 async function saveRecipient() {
-  await api('/config', {
-    method: 'PUT',
-    body: JSON.stringify({ recipient_email: $('#recipientEmail').value }),
-  });
-  toast('Recipient saved');
+  try {
+    await api('/config', {
+      method: 'PUT',
+      body: JSON.stringify({ recipient_email: $('#recipientEmail').value }),
+    });
+    toast('Recipient saved');
+  } catch (e) {
+    toast(e.message, true);
+  }
 }
 
 // ── Init ────────────────────────────────────────────────────────────
