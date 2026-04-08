@@ -7,3 +7,5 @@ beautifulsoup4
 requests
 tenacity
 bcrypt
+google-cloud-discoveryengine
+python-dotenv

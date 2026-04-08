@@ -7,8 +7,21 @@ class UserPrivilege(StrEnum):
 
 
 class RunStatus(StrEnum):
+    """Whether the scheduled script is active or stopped."""
     RUNNING = "running"
     STOPPED = "stopped"
+
+
+class RunResult(StrEnum):
+    """Status of an individual job scout run."""
+    RUNNING = "running"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+class SearchProvider(StrEnum):
+    BRAVE = "brave"
+    VERTEX = "vertex"
 
 
 class Freshness(StrEnum):

@@ -2,18 +2,26 @@ user_email: "eshansingh2409@gmail.com"
 user_password: "dream-like-me"
 
 search:
-  freshness: "pm"  # pd=past day, pw=past week, pm=past month, py=past year
-  country: "IN"    # Brave country code (ISO 3166-1 alpha-2)
-  ui_lang: "en-IN" # Brave host language
-  max_results_per_query: 20
+  provider: "vertex"  # "brave" or "vertex"
+  freshness: "pm"       # pd=past day, pw=past week, pm=past month, py=past year (Brave only)
+  country: "IN"         # Brave country code (Brave only)
+  ui_lang: "en-IN"      # Brave host language (Brave only)
+  brave_max_results: 20    # Brave API caps at 20
+  vertex_max_results: 50   # Vertex supports up to 100
   base_query: >
     ("Software Engineer" OR "Backend Engineer" OR "SDE" OR "Backend Developer" OR "Software Developer")  India
-  sites:
+  sites:                # Brave: combined as site:host <base_query>
     - boards.greenhouse.io
     - myworkdayjobs.com
     - lever.co
     - jobs.ashbyhq.com
     - jobs.smartrecruiters.com
+  vertex_sites:         # Vertex: URI patterns synced to datastore whitelist
+    - "*.boards.greenhouse.io/*"
+    - "*.myworkdayjobs.com/*"
+    - "*.lever.co/*"
+    - "*.jobs.ashbyhq.com/*"
+    - "*.jobs.smartrecruiters.com/*"
 
 candidate_profile: |
   - 2 years of full-time post-graduation experience in backend/infra engineering

@@ -6,6 +6,9 @@ import threading
 from functools import wraps
 from zoneinfo import ZoneInfo
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import Flask, jsonify, request, send_from_directory, session
@@ -17,7 +20,7 @@ import yaml
 
 import job_scout
 from db import get_db
-from enums import UserPrivilege, RunStatus, Freshness
+from enums import UserPrivilege, RunStatus, Freshness, SearchProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger("server")
@@ -334,13 +337,17 @@ def api_script_stop(config):
 @app.route("/api/debug/search", methods=["POST"])
 @login_required
 def api_debug_search():
-    """Test a single Google query and return raw results."""
+    """Test a single search query and return raw results."""
     data = request.get_json()
     query = data.get("query", "").strip()
     if not query:
         return jsonify({"error": "query is required"}), 400
     max_results = data.get("max_results", 5)
-    result = job_scout.test_search(query, max_results)
+    provider = data.get("provider", SearchProvider.BRAVE)
+    if provider == SearchProvider.VERTEX:
+        result = job_scout.test_vertex_search(query, max_results)
+    else:
+        result = job_scout.test_search(query, max_results)
     return jsonify(result)
 
 
@@ -351,6 +358,34 @@ def api_debug_queries(config):
     """Show the fully rendered queries that would be used in a run."""
     queries = job_scout.build_queries(config)
     return jsonify(queries)
+
+
+# ── Routes: Vertex Target Sites ───────────────────────────────────────
+
+@app.route("/api/vertex/sites")
+@login_required
+def api_vertex_list_sites():
+    """List whitelisted URI patterns from the Vertex datastore."""
+    try:
+        sites = job_scout.list_vertex_target_sites()
+        return jsonify(sites)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/vertex/sites/sync", methods=["POST"])
+@login_required
+@config_required
+def api_vertex_sync_sites(config):
+    """Sync the Vertex datastore whitelist to match the patterns stored in config."""
+    patterns = config.get("search", {}).get("vertex_sites", [])
+    if not patterns:
+        return jsonify({"error": "No vertex_sites in config to sync"}), 400
+    try:
+        result = job_scout.sync_vertex_target_sites(patterns)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ── Routes: Timezone ───────────────────────────────────────────────────
@@ -538,6 +573,13 @@ def api_update_schedule(config):
 
 # ── Routes: Seen jobs ─────────────────────────────────────────────────
 
+@app.route("/api/seen")
+@login_required
+def api_list_seen():
+    jobs = job_scout.list_seen_jobs()
+    return jsonify(jobs)
+
+
 @app.route("/api/seen", methods=["DELETE"])
 @login_required
 def api_clear_seen():
@@ -554,6 +596,35 @@ def api_clear_seen_urls():
         return jsonify({"error": "urls must be a non-empty list"}), 400
     count = job_scout.clear_seen_urls(urls)
     return jsonify({"message": f"Cleared {count} URLs"})
+
+
+# ── Routes: Errored jobs ─────────────────────────────────────────────
+
+@app.route("/api/errored")
+@login_required
+def api_list_errored():
+    jobs = job_scout.list_errored_jobs()
+    return jsonify(jobs)
+
+
+@app.route("/api/errored", methods=["DELETE"])
+@login_required
+def api_clear_errored():
+    count = job_scout.clear_errored_jobs()
+    return jsonify({"message": f"Cleared {count} errored jobs"})
+
+
+@app.route("/api/errored/retry", methods=["POST"])
+@login_required
+def api_retry_errored():
+    email = session.get("email")
+    if not email:
+        return jsonify({"error": "No user session"}), 401
+    try:
+        result = job_scout.retry_errored_jobs(email)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ── Startup ────────────────────────────────────────────────────────────
