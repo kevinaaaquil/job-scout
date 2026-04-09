@@ -200,6 +200,7 @@
     <button class="tab active" data-tab="runs">Run History</button>
     <button class="tab" data-tab="queries">Search Queries</button>
     <button class="tab" data-tab="schedule">Schedule</button>
+    <button class="tab" data-tab="seen">Seen Jobs</button>
     <button class="tab" data-tab="profile">Candidate Profile</button>
     <button class="tab" data-tab="settings">Settings</button>
   </div>
@@ -223,54 +224,102 @@
   <!-- Search Queries -->
   <div class="panel" id="panel-queries">
     <div class="card">
-      <h3>Brave Search</h3>
-      <p style="font-size:0.8rem;color:var(--text2);margin-bottom:12px;">
-        One base query is combined with each job-board host as <code style="background:var(--bg);padding:2px 6px;border-radius:4px;">site:host …</code>. Saved only when you click Save.
-      </p>
-      <div class="form-row">
-        <label>Brave search freshness</label>
-        <select id="searchFreshness">
-          <option value="">Any time (no freshness filter)</option>
-          <option value="pd">Past day</option>
-          <option value="pw">Past week</option>
-          <option value="pm">Past month</option>
-          <option value="py">Past year</option>
-        </select>
+      <h3>Search Provider</h3>
+      <div class="form-row" style="margin-bottom:20px;">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <span style="font-size:0.85rem;color:var(--text2);font-weight:600;">Brave</span>
+          <label style="position:relative;display:inline-block;width:48px;height:26px;margin:0;">
+            <input type="checkbox" id="providerToggle" onchange="onProviderToggle()" style="opacity:0;width:0;height:0;position:absolute;">
+            <span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:var(--surface2);border-radius:13px;transition:0.3s;"></span>
+            <span id="toggleKnob" style="position:absolute;content:'';height:20px;width:20px;left:3px;bottom:3px;background:white;border-radius:50%;transition:0.3s;z-index:1;"></span>
+          </label>
+          <span style="font-size:0.85rem;color:var(--text2);font-weight:600;">Vertex AI</span>
+        </div>
       </div>
-      <div class="form-row">
-        <label>Search country</label>
-        <select id="searchCountry">
-          <option value="IN">India</option>
-          <option value="US">United States</option>
-          <option value="GB">United Kingdom</option>
-          <option value="DE">Germany</option>
-          <option value="CA">Canada</option>
-          <option value="AU">Australia</option>
-          <option value="SG">Singapore</option>
-          <option value="">All (no country filter)</option>
-        </select>
+
+      <!-- Brave-specific fields -->
+      <div id="braveFields">
+        <p style="font-size:0.8rem;color:var(--text2);margin-bottom:12px;">
+          One base query is combined with each job-board host as <code style="background:var(--bg);padding:2px 6px;border-radius:4px;">site:host …</code>. Saved only when you click Save.
+        </p>
+        <div class="form-row">
+          <label>Brave search freshness</label>
+          <select id="searchFreshness">
+            <option value="">Any time (no freshness filter)</option>
+            <option value="pd">Past day</option>
+            <option value="pw">Past week</option>
+            <option value="pm">Past month</option>
+            <option value="py">Past year</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Search country</label>
+          <select id="searchCountry">
+            <option value="IN">India</option>
+            <option value="US">United States</option>
+            <option value="GB">United Kingdom</option>
+            <option value="DE">Germany</option>
+            <option value="CA">Canada</option>
+            <option value="AU">Australia</option>
+            <option value="SG">Singapore</option>
+            <option value="">All (no country filter)</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Host language</label>
+          <select id="searchUiLang">
+            <option value="en-IN">English (India)</option>
+            <option value="en-US">English (US)</option>
+            <option value="en-GB">English (UK)</option>
+            <option value="de-DE">German</option>
+            <option value="en-CA">English (Canada)</option>
+            <option value="en-AU">English (Australia)</option>
+            <option value="en-SG">English (Singapore)</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Max results per query (max 20)</label>
+          <input type="number" id="braveMaxResults" min="1" max="20" placeholder="20" value="20">
+        </div>
+        <div class="form-row">
+          <label>Base query</label>
+          <textarea id="baseQueryInput" rows="4" placeholder='("Software Engineer" OR "Backend") India'></textarea>
+        </div>
+        <div class="form-row">
+          <label>Board hosts (one per row)</label>
+          <div id="sitesList"></div>
+          <button type="button" class="secondary" onclick="addSite()" style="margin-top:8px;">+ Add site</button>
+        </div>
       </div>
-      <div class="form-row">
-        <label>Host language</label>
-        <select id="searchUiLang">
-          <option value="en-IN">English (India)</option>
-          <option value="en-US">English (US)</option>
-          <option value="en-GB">English (UK)</option>
-          <option value="de-DE">German</option>
-          <option value="en-CA">English (Canada)</option>
-          <option value="en-AU">English (Australia)</option>
-          <option value="en-SG">English (Singapore)</option>
-        </select>
+
+      <!-- Vertex-specific fields -->
+      <div id="vertexFields" style="display:none;">
+        <p style="font-size:0.8rem;color:var(--text2);margin-bottom:12px;">
+          Vertex AI Search uses a whitelisted datastore — URL filtering is handled by your datastore configuration, so no <code style="background:var(--bg);padding:2px 6px;border-radius:4px;">site:</code> prefixes are needed.
+        </p>
+        <div class="form-row">
+          <label>Search query</label>
+          <textarea id="vertexQueryInput" rows="4" placeholder='("Software Engineer" OR "Backend Engineer") India'></textarea>
+        </div>
+        <div class="form-row">
+          <label>Max results per query (max 100)</label>
+          <input type="number" id="vertexMaxResults" min="1" max="100" placeholder="50" value="50">
+        </div>
+        <div class="form-row">
+          <label>Whitelisted site patterns</label>
+          <p style="font-size:0.75rem;color:var(--text2);margin-bottom:8px;">
+            URI patterns for the Vertex datastore (e.g. <code style="background:var(--bg);padding:2px 6px;border-radius:4px;">boards.greenhouse.io/*</code>). Save stores locally; Sync pushes to Vertex.
+          </p>
+          <div id="vertexSitesList"></div>
+          <button type="button" class="secondary" onclick="addVertexSite()" style="margin-top:8px;">+ Add pattern</button>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:8px;margin-bottom:4px;">
+          <span id="vertexSyncStatus" style="font-size:0.8rem;color:var(--text2);flex:1;"></span>
+          <button type="button" class="secondary" onclick="fetchVertexSites()" style="font-size:0.8rem;padding:6px 14px;">Fetch from Vertex</button>
+          <button type="button" class="secondary" onclick="syncVertexSites()" style="font-size:0.8rem;padding:6px 14px;">Sync to Vertex</button>
+        </div>
       </div>
-      <div class="form-row">
-        <label>Base query</label>
-        <textarea id="baseQueryInput" rows="4" placeholder='("Software Engineer" OR "Backend") India'></textarea>
-      </div>
-      <div class="form-row">
-        <label>Board hosts (one per row)</label>
-        <div id="sitesList"></div>
-        <button type="button" class="secondary" onclick="addSite()" style="margin-top:8px;">+ Add site</button>
-      </div>
+
       <div class="form-actions">
         <button type="button" onclick="saveQueries()">Save Queries</button>
       </div>
@@ -288,6 +337,24 @@
       </div>
       <div class="form-actions">
         <button onclick="saveSchedule()">Save Schedule</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Seen Jobs -->
+  <div class="panel" id="panel-seen">
+    <div class="card">
+      <h3>Seen Jobs</h3>
+      <p style="font-size:0.8rem;color:var(--text2);margin-bottom:12px;">
+        All previously discovered and scored URLs. These are skipped in future runs.
+      </p>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;">
+        <input type="text" id="seenSearchInput" placeholder="Filter by URL, title, or source..." oninput="filterSeenJobs()" style="flex:1;">
+        <span id="seenCount" style="font-size:0.8rem;color:var(--text2);white-space:nowrap;"></span>
+      </div>
+      <div id="seenJobsList" style="max-height:600px;overflow-y:auto;"></div>
+      <div class="empty-state" id="seenEmpty" style="display:none;">
+        <p>No seen jobs yet.</p>
       </div>
     </div>
   </div>
@@ -339,6 +406,19 @@
       </p>
       <div class="form-actions" style="justify-content:flex-start;">
         <button class="danger" onclick="clearSeen()">Clear All Seen Jobs</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Errored Jobs</h3>
+      <p style="font-size:0.8rem;color:var(--text2);margin-bottom:12px;">
+        Jobs that failed during fetch or scoring. These are skipped in regular runs. Retry to re-evaluate them.
+      </p>
+      <div id="erroredJobsList" style="margin-bottom:12px;"></div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span id="erroredStatus" style="font-size:0.8rem;color:var(--text2);flex:1;"></span>
+        <button class="secondary" onclick="loadErroredJobs()">Refresh</button>
+        <button onclick="retryErroredJobs()">Retry All</button>
+        <button class="danger" onclick="clearErroredJobs()">Clear All</button>
       </div>
     </div>
     <div class="card">
@@ -603,6 +683,25 @@ function escHtml(s) {
 // ── Search (base query + sites) ─────────────────────────────────────
 
 let sitesData = [];
+let currentProvider = 'brave';
+
+function onProviderToggle() {
+  const isVertex = $('#providerToggle').checked;
+  currentProvider = isVertex ? 'vertex' : 'brave';
+  updateProviderUI();
+}
+
+function updateProviderUI() {
+  const isVertex = currentProvider === 'vertex';
+  $('#providerToggle').checked = isVertex;
+  $('#braveFields').style.display = isVertex ? 'none' : '';
+  $('#vertexFields').style.display = isVertex ? '' : 'none';
+  // Toggle knob position
+  $('#toggleKnob').style.transform = isVertex ? 'translateX(22px)' : 'translateX(0)';
+  // Track background color
+  const track = $('#providerToggle').nextElementSibling;
+  track.style.background = isVertex ? 'var(--accent)' : 'var(--surface2)';
+}
 
 function parseLegacyQueries(queries) {
   const sites = [];
@@ -647,14 +746,32 @@ function applyFreshnessToSelect(raw) {
 async function loadQueries() {
   const config = await api('/config');
   const s = config.search || {};
+
+  // Set provider toggle
+  currentProvider = s.provider || 'brave';
+  updateProviderUI();
+
+  // Brave fields
   applyFreshnessToSelect(s.freshness);
   $('#searchCountry').value = s.country || 'IN';
   $('#searchUiLang').value = s.ui_lang || 'en-IN';
+  $('#braveMaxResults').value = s.brave_max_results || s.max_results_per_query || 20;
   $('#baseQueryInput').value = s.base_query || '';
 
   sitesData = (s.sites || []).map(h => ({ host: h }));
   if (!sitesData.length) sitesData = [{ host: '' }];
   renderSites();
+
+  // Vertex fields
+  $('#vertexQueryInput').value = s.base_query || '';
+  $('#vertexMaxResults').value = s.vertex_max_results || 50;
+  vertexSitesData = (s.vertex_sites || []).filter(Boolean);
+  if (!vertexSitesData.length && currentProvider === 'vertex') {
+    // No local patterns saved — try fetching from Vertex
+    fetchVertexSites().catch(() => {});
+  }
+  if (!vertexSitesData.length) vertexSitesData = [''];
+  renderVertexSites();
 }
 
 function collectSitesFromDom() {
@@ -668,30 +785,132 @@ function collectSitesFromDom() {
 
 async function saveQueries() {
   try {
-    const base = $('#baseQueryInput').value.trim();
-    const sites = collectSitesFromDom();
-    const freshness = $('#searchFreshness').value;
-    const country = $('#searchCountry').value;
-    const ui_lang = $('#searchUiLang').value;
     const config = await api('/config');
-    const search = {
-      ...(config.search || {}),
-      freshness: freshness || '',
-      country: country || '',
-      ui_lang,
-      base_query: base,
-      sites,
-      queries: [],
-    };
+    const isVertex = currentProvider === 'vertex';
+
+    let search;
+    if (isVertex) {
+      const base = $('#vertexQueryInput').value.trim();
+      const maxResults = parseInt($('#vertexMaxResults').value) || 50;
+      const vSites = collectVertexSitesFromDom();
+      search = {
+        ...(config.search || {}),
+        provider: 'vertex',
+        base_query: base,
+        vertex_max_results: maxResults,
+        vertex_sites: vSites,
+      };
+    } else {
+      const base = $('#baseQueryInput').value.trim();
+      const sites = collectSitesFromDom();
+      const freshness = $('#searchFreshness').value;
+      const country = $('#searchCountry').value;
+      const ui_lang = $('#searchUiLang').value;
+      const maxResults = parseInt($('#braveMaxResults').value) || 20;
+      search = {
+        ...(config.search || {}),
+        provider: 'brave',
+        brave_max_results: maxResults,
+        freshness: freshness || '',
+        country: country || '',
+        ui_lang,
+        base_query: base,
+        sites,
+        queries: [],
+      };
+    }
+
     await api('/config', {
       method: 'PUT',
       body: JSON.stringify({ search }),
     });
-    sitesData = sites.length ? sites.map(h => ({ host: h })) : [{ host: '' }];
-    renderSites();
+
+    if (!isVertex) {
+      const sites = collectSitesFromDom();
+      sitesData = sites.length ? sites.map(h => ({ host: h })) : [{ host: '' }];
+      renderSites();
+    }
     toast('Queries saved');
   } catch (e) {
     toast(e.message, true);
+  }
+}
+
+// ── Vertex Sites ───────────────────────────────────────────────────
+
+let vertexSitesData = [];
+
+function renderVertexSites() {
+  $('#vertexSitesList').innerHTML = vertexSitesData.map((s, i) => `
+    <div class="site-item" style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
+      <input type="text" value="${escHtml(s)}" placeholder="boards.greenhouse.io/*" style="flex:1;">
+      <button type="button" class="secondary danger" onclick="vertexSitesData.splice(${i},1);renderVertexSites();" style="padding:4px 12px;font-size:0.8rem;">Remove</button>
+    </div>
+  `).join('');
+}
+
+function addVertexSite() {
+  vertexSitesData.push('');
+  renderVertexSites();
+  // Focus the new input
+  const inputs = $$('#vertexSitesList .site-item input[type="text"]');
+  if (inputs.length) inputs[inputs.length - 1].focus();
+}
+
+function collectVertexSitesFromDom() {
+  const patterns = [];
+  $$('#vertexSitesList .site-item input[type="text"]').forEach(inp => {
+    const v = inp.value.trim();
+    if (v) patterns.push(v);
+  });
+  return patterns;
+}
+
+async function fetchVertexSites() {
+  try {
+    $('#vertexSyncStatus').textContent = 'Fetching from Vertex...';
+    const sites = await api('/vertex/sites');
+    if (Array.isArray(sites)) {
+      vertexSitesData = sites.map(s => s.uri_pattern).filter(Boolean);
+      renderVertexSites();
+      $('#vertexSyncStatus').textContent = `Fetched ${vertexSitesData.length} patterns from Vertex`;
+    }
+  } catch (e) {
+    $('#vertexSyncStatus').textContent = '';
+    toast(e.message, true);
+  }
+}
+
+async function syncVertexSites() {
+  const patterns = collectVertexSitesFromDom();
+  if (!patterns.length) {
+    toast('No patterns to sync', true);
+    return;
+  }
+
+  // First save to mongo so the sync endpoint can read them
+  try {
+    const config = await api('/config');
+    const search = { ...(config.search || {}), vertex_sites: patterns };
+    await api('/config', { method: 'PUT', body: JSON.stringify({ search }) });
+  } catch (e) {
+    toast('Failed to save before sync: ' + e.message, true);
+    return;
+  }
+
+  try {
+    $('#vertexSyncStatus').textContent = 'Syncing to Vertex...';
+    const result = await api('/vertex/sites/sync', { method: 'POST' });
+    const parts = [];
+    if (result.added?.length) parts.push(`${result.added.length} added`);
+    if (result.removed?.length) parts.push(`${result.removed.length} removed`);
+    if (result.errors?.length) parts.push(`${result.errors.length} errors`);
+    const msg = parts.length ? parts.join(', ') : 'Already in sync';
+    $('#vertexSyncStatus').textContent = msg;
+    toast('Sync complete: ' + msg);
+  } catch (e) {
+    $('#vertexSyncStatus').textContent = '';
+    toast('Sync failed: ' + e.message, true);
   }
 }
 
@@ -789,6 +1008,134 @@ async function saveRecipient() {
   }
 }
 
+// ── Seen Jobs ──────────────────────────────────────────────────────
+
+let seenJobsCache = [];
+
+async function loadSeenJobs() {
+  try {
+    seenJobsCache = await api('/seen');
+    renderSeenJobs(seenJobsCache);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function filterSeenJobs() {
+  const q = ($('#seenSearchInput').value || '').toLowerCase().trim();
+  if (!q) {
+    renderSeenJobs(seenJobsCache);
+    return;
+  }
+  const filtered = seenJobsCache.filter(j =>
+    (j.url || '').toLowerCase().includes(q) ||
+    (j.source || '').toLowerCase().includes(q) ||
+    (j.reasons || []).join(' ').toLowerCase().includes(q)
+  );
+  renderSeenJobs(filtered);
+}
+
+function renderSeenJobs(jobs) {
+  const el = $('#seenJobsList');
+  if (!jobs.length) {
+    el.innerHTML = '';
+    $('#seenEmpty').style.display = '';
+    $('#seenCount').textContent = '';
+    return;
+  }
+  $('#seenEmpty').style.display = 'none';
+  $('#seenCount').textContent = `${jobs.length} job${jobs.length !== 1 ? 's' : ''}`;
+
+  el.innerHTML = jobs.map(j => {
+    const score = j.match_score != null ? j.match_score : '—';
+    const scoreColor = score >= 60 ? 'var(--green)' : score >= 40 ? 'var(--yellow)' : 'var(--text2)';
+    const borderColor = score >= 60 ? 'var(--green)' : score >= 40 ? 'var(--yellow)' : 'var(--border)';
+    const bd = j.score_breakdown && typeof j.score_breakdown === 'object' ? j.score_breakdown : null;
+    const breakdownHtml = bd ? ['experience','tech_stack','role_fit','location'].map(k => {
+      const b = bd[k];
+      if (!b || typeof b !== 'object') return '';
+      return `<span style="margin-right:10px;">${escHtml(k)}: <strong>${b.score}</strong>/25</span>`;
+    }).filter(Boolean).join('') : '';
+    const reasons = (j.reasons || []).map(r => `<li>${escHtml(r)}</li>`).join('');
+    const dqs = (j.disqualifiers || []).map(d => `<li style="color:var(--red);">${escHtml(d)}</li>`).join('');
+
+    return `
+    <div style="background:var(--bg);border:1px solid var(--border);border-left:3px solid ${borderColor};border-radius:4px;padding:10px 14px;margin-bottom:8px;font-size:0.8rem;">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;">
+        <strong style="font-size:0.85rem;">${escHtml(j.url ? new URL(j.url).pathname.split('/').filter(Boolean).pop() || j.url : 'Unknown')}</strong>
+        <span style="color:${scoreColor};font-weight:700;font-size:0.9rem;">${score}${score !== '—' ? '/100' : ''}</span>
+      </div>
+      <div style="color:var(--text2);margin-top:2px;">
+        ${escHtml(j.source || '')} &middot;
+        <a href="${escHtml(j.url || '')}" target="_blank" style="color:var(--accent);">Open</a>
+        ${j.first_seen ? ' &middot; First seen: ' + escHtml(j.first_seen) : ''}
+        ${j.scored_at ? ' &middot; Scored: ' + escHtml(j.scored_at.split('T')[0]) : ''}
+      </div>
+      ${breakdownHtml ? `<div style="margin-top:4px;color:var(--text2);font-size:0.75rem;">${breakdownHtml}</div>` : ''}
+      ${reasons || dqs ? `<ul style="margin:4px 0 0 14px;color:var(--text2);">${reasons}${dqs}</ul>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ── Errored Jobs ───────────────────────────────────────────────────
+
+async function loadErroredJobs() {
+  try {
+    const jobs = await api('/errored');
+    const el = $('#erroredJobsList');
+    if (!jobs.length) {
+      el.innerHTML = '<p style="font-size:0.8rem;color:var(--text2);">No errored jobs.</p>';
+      $('#erroredStatus').textContent = '';
+      return;
+    }
+    $('#erroredStatus').textContent = `${jobs.length} errored job${jobs.length !== 1 ? 's' : ''}`;
+    el.innerHTML = jobs.map(j => `
+      <div style="background:var(--bg);border:1px solid var(--border);border-left:3px solid var(--red);border-radius:4px;padding:8px 12px;margin-bottom:6px;font-size:0.8rem;">
+        <strong>${escHtml(j.title || 'Untitled')}</strong>
+        <span style="color:var(--text2);float:right;">x${j.attempt_count || 1}</span>
+        <div style="color:var(--text2);margin-top:2px;">
+          ${escHtml(j.source || '')} &middot;
+          <a href="${escHtml(j.url)}" target="_blank" style="color:var(--accent);">View</a> &middot;
+          ${escHtml(j.error_reason || '')}
+        </div>
+      </div>
+    `).join('');
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function retryErroredJobs() {
+  try {
+    $('#erroredStatus').textContent = 'Retrying...';
+    const result = await api('/errored/retry', { method: 'POST' });
+    const parts = [];
+    parts.push(`${result.retried} retried`);
+    parts.push(`${result.succeeded} succeeded`);
+    parts.push(`${result.still_errored} still errored`);
+    if (result.matched?.length) parts.push(`${result.matched.length} matched`);
+    if (result.borderline?.length) parts.push(`${result.borderline.length} borderline`);
+    const msg = parts.join(', ');
+    $('#erroredStatus').textContent = msg;
+    toast('Retry complete: ' + msg);
+    await loadErroredJobs();
+  } catch (e) {
+    $('#erroredStatus').textContent = '';
+    toast('Retry failed: ' + e.message, true);
+  }
+}
+
+async function clearErroredJobs() {
+  if (!confirm('Clear all errored jobs? They will be re-discovered on the next run.')) return;
+  try {
+    const res = await api('/errored', { method: 'DELETE' });
+    toast(res.message || 'Cleared');
+    await loadErroredJobs();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
 // ── Init ────────────────────────────────────────────────────────────
 
 async function loadTimezone() {
@@ -807,6 +1154,8 @@ async function init() {
     loadSchedule(),
     loadProfile(),
     loadSettings(),
+    loadSeenJobs(),
+    loadErroredJobs(),
   ]);
 }
 

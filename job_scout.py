@@ -1,4 +1,5 @@
 import html as html_mod
+import copy
 import json
 import logging
 import os
@@ -14,11 +15,13 @@ from pathlib import Path
 import requests
 import yaml
 from bs4 import BeautifulSoup
-from enums import RunStatus, Freshness
+from enums import RunStatus, RunResult, Freshness, SearchProvider
 from openai import OpenAI, APIConnectionError, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from pymongo import UpdateOne
+
+from google.cloud import discoveryengine_v1 as discoveryengine
 
 from db import get_db
 
@@ -84,12 +87,15 @@ DEFAULT_CONFIG = {
     "email": "",
     "run_status": RunStatus.STOPPED,
     "search": {
+        "provider": SearchProvider.BRAVE,
         "freshness": Freshness.PAST_WEEK,
         "country": "IN",
         "ui_lang": "en-IN",
-        "max_results_per_query": 20,
+        "brave_max_results": 20,
+        "vertex_max_results": 50,
         "base_query": "",
         "sites": [],
+        "vertex_sites": [],  # URI patterns for Vertex datastore whitelist
         "queries": [],  # legacy: used if base_query + sites are empty
     },
     "candidate_profile": "",
@@ -131,7 +137,7 @@ def seed_config(email):
     if db.config.find_one({"email": email}):
         return load_config(email)
 
-    seed = {k: v for k, v in DEFAULT_CONFIG.items()}
+    seed = copy.deepcopy(DEFAULT_CONFIG)
     seed["email"] = email
 
     if SEED_CONFIG_PATH.exists():
@@ -160,6 +166,7 @@ def save_config(config):
 def _ensure_indexes():
     db = get_db()
     db.seen_jobs.create_index("url", unique=True)
+    db.errored_jobs.create_index("url", unique=True)
     db.run_history.create_index([("timestamp", -1)])
 
 
@@ -210,6 +217,13 @@ def mark_jobs_seen(all_results, scored_jobs=None):
 
 # ── Clear seen jobs ──────────────────────────────────────────────────
 
+def list_seen_jobs():
+    """Return all seen jobs with metadata, most recent first."""
+    db = get_db()
+    docs = list(db.seen_jobs.find({}, {"_id": 0}).sort("first_seen", -1).limit(500))
+    return docs
+
+
 def clear_all_seen():
     """Remove all seen_jobs records, allowing full re-evaluation."""
     db = get_db()
@@ -223,6 +237,60 @@ def clear_seen_urls(urls):
     db = get_db()
     result = db.seen_jobs.delete_many({"url": {"$in": urls}})
     logger.info("Cleared %d seen jobs", result.deleted_count)
+    return result.deleted_count
+
+
+# ── Errored jobs (MongoDB) ────────────────────────────────────────────
+
+def mark_jobs_errored(jobs):
+    """Save jobs that failed during fetch/score to the errored_jobs collection."""
+    if not jobs:
+        return
+    db = get_db()
+    now_iso = datetime.now().isoformat()
+    ops = []
+    for job in jobs:
+        ops.append(
+            UpdateOne(
+                {"url": job["url"]},
+                {
+                    "$set": {
+                        "url": job["url"],
+                        "title": job.get("title", ""),
+                        "source": job.get("source", ""),
+                        "error_reason": job.get("disqualifiers", ["Unknown"])[0] if job.get("disqualifiers") else "Fetch/score failed",
+                        "last_attempted": now_iso,
+                    },
+                    "$inc": {"attempt_count": 1},
+                    "$setOnInsert": {"first_errored": now_iso},
+                },
+                upsert=True,
+            )
+        )
+    db.errored_jobs.bulk_write(ops, ordered=False)
+    logger.info("Marked %d jobs as errored", len(jobs))
+
+
+def remove_from_errored(urls):
+    """Remove URLs from errored_jobs (after successful retry)."""
+    if not urls:
+        return
+    db = get_db()
+    db.errored_jobs.delete_many({"url": {"$in": urls}})
+
+
+def list_errored_jobs():
+    """Return all errored jobs."""
+    db = get_db()
+    docs = list(db.errored_jobs.find({}, {"_id": 0}).sort("last_attempted", -1))
+    return docs
+
+
+def clear_errored_jobs():
+    """Clear all errored jobs."""
+    db = get_db()
+    result = db.errored_jobs.delete_many({})
+    logger.info("Cleared %d errored jobs", result.deleted_count)
     return result.deleted_count
 
 
@@ -255,13 +323,20 @@ def _site_label(host: str) -> str:
 
 def build_queries(config):
     search = config.get("search") or {}
+    provider = search.get("provider", SearchProvider.BRAVE)
     base = " ".join((search.get("base_query") or "").split())
     sites = [str(s).strip() for s in (search.get("sites") or []) if str(s).strip()]
-    if base and sites:
+
+    if provider == SearchProvider.VERTEX:
+        if not base:
+            raise RuntimeError("Vertex provider requires a base_query")
+        return [{"name": SearchProvider.VERTEX, "query": base}]
+    elif base and sites:
         return [
             {"name": _site_label(site), "query": f"site:{site} {base}"}
             for site in sites
         ]
+
     queries = []
     for q in search.get("queries") or []:
         rendered = " ".join((q.get("query") or "").split())
@@ -401,21 +476,229 @@ def test_search(query_text, max_results=5, freshness=Freshness.PAST_WEEK, countr
         return {"query": query_text, "count": 0, "urls": [], "error": str(e)}
 
 
+# ── Step 2b: Vertex AI Search ────────────────────────────────────────
+
+def _get_vertex_client():
+    """Create a Vertex AI Search client (reuses credentials from GOOGLE_APPLICATION_CREDENTIALS)."""
+    return discoveryengine.SearchServiceClient()
+
+
+def _vertex_serving_config():
+    """Build the serving config resource name from env vars."""
+    project_id = os.environ.get("VERTEX_PROJECT_ID", "")
+    engine_id = os.environ.get("VERTEX_ENGINE_ID", "")
+    if not project_id or not engine_id:
+        raise RuntimeError("VERTEX_PROJECT_ID and VERTEX_ENGINE_ID environment variables are required")
+    return f"projects/{project_id}/locations/global/collections/default_collection/engines/{engine_id}/servingConfigs/default_search"
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(Exception),
+    reraise=True,
+)
+def _vertex_search(query, max_results=20):
+    """Single Vertex AI Search call.
+
+    Returns (results, error_message). Each result is {"url": ..., "title": ...}.
+    """
+    client = _get_vertex_client()
+    serving_config = _vertex_serving_config()
+
+    request = discoveryengine.SearchRequest(
+        serving_config=serving_config,
+        query=query,
+        page_size=min(max_results, 100),
+    )
+
+    try:
+        response = client.search(request)
+    except Exception as e:
+        logger.error("  Vertex AI Search error: %s", e)
+        return [], str(e)
+
+    results = []
+    for result in response.results:
+        doc = result.document
+        doc_data = doc.derived_struct_data
+        url = ""
+        title = ""
+        if doc_data:
+            link = doc_data.get("link") or doc_data.get("formattedUrl") or ""
+            url = str(link)
+            t = doc_data.get("title") or doc_data.get("htmlTitle") or ""
+            title = str(t)
+        if url:
+            results.append({"url": url, "title": title})
+    return results, None
+
+
+def run_vertex_searches(queries, max_results):
+    """Run all queries through Vertex AI Search. Queries should be plain text (no site: prefix)."""
+    all_results = []
+    for i, q in enumerate(queries):
+        logger.info("Vertex searching [%s]:\n  %s", q["name"], q["query"])
+        try:
+            results, err = _vertex_search(q["query"], max_results)
+            for r in results:
+                all_results.append({"url": r["url"], "title": r.get("title", ""), "source": q["name"]})
+            logger.info("  Found %d results for %s", len(results), q["name"])
+            if err and not results:
+                logger.warning("  No results for %s (%s)", q["name"], err)
+            elif not results:
+                logger.warning("  0 results for %s", q["name"])
+        except Exception as e:
+            logger.error("  Vertex search failed for %s: %s", q["name"], e)
+        if i < len(queries) - 1:
+            time.sleep(0.5)
+    return all_results
+
+
+def test_vertex_search(query_text, max_results=5):
+    """Run a single Vertex AI search for debugging."""
+    try:
+        _vertex_serving_config()  # validate env vars
+    except RuntimeError as e:
+        return {"query": query_text, "count": 0, "urls": [], "error": str(e)}
+    logger.info("Test Vertex search: %s", query_text)
+    try:
+        results, err = _vertex_search(query_text, max_results)
+        return {
+            "query": query_text,
+            "count": len(results),
+            "urls": [r["url"] for r in results],
+            "error": err,
+        }
+    except Exception as e:
+        return {"query": query_text, "count": 0, "urls": [], "error": str(e)}
+
+
+# ── Vertex AI: Target Site Management ─────────────────────────────────
+
+def _vertex_site_search_engine_parent():
+    """Build the siteSearchEngine resource name."""
+    project_id = os.environ.get("VERTEX_PROJECT_ID", "")
+    datastore_id = os.environ.get("VERTEX_DATASTORE_ID", "")
+    if not project_id or not datastore_id:
+        raise RuntimeError("VERTEX_PROJECT_ID and VERTEX_DATASTORE_ID environment variables are required")
+    return (
+        f"projects/{project_id}/locations/global"
+        f"/collections/default_collection/dataStores/{datastore_id}"
+        f"/siteSearchEngine"
+    )
+
+
+def list_vertex_target_sites():
+    """List all whitelisted URI patterns from the Vertex datastore."""
+    client = discoveryengine.SiteSearchEngineServiceClient()
+    parent = _vertex_site_search_engine_parent()
+    sites = []
+    for site in client.list_target_sites(parent=parent):
+        # generated_uri_pattern is the canonical form; provided_uri_pattern may be empty
+        pattern = site.generated_uri_pattern or site.provided_uri_pattern
+        sites.append({
+            "name": site.name,
+            "uri_pattern": pattern,
+            "type": site.type_.name,
+            "exact_match": site.exact_match,
+        })
+    return sites
+
+
+def _normalize_uri_pattern(pattern):
+    """Normalize a URI pattern to match Vertex's generated format.
+
+    Vertex normalizes patterns like 'boards.greenhouse.io/*' to '*.boards.greenhouse.io/*'.
+    Apply the same normalization locally so diffs compare correctly.
+    """
+    pattern = pattern.strip()
+    if not pattern:
+        return pattern
+    # If it doesn't start with *. already, prepend it
+    if not pattern.startswith("*."):
+        pattern = "*." + pattern
+    # Ensure it ends with /*
+    if not pattern.endswith("/*"):
+        pattern = pattern.rstrip("/") + "/*"
+    return pattern
+
+
+def sync_vertex_target_sites(desired_patterns):
+    """Sync the Vertex datastore whitelist to match the desired URI patterns.
+
+    - Adds patterns not yet in the datastore.
+    - Removes patterns in the datastore but not in the desired list.
+    Returns a summary dict.
+    """
+    client = discoveryengine.SiteSearchEngineServiceClient()
+    parent = _vertex_site_search_engine_parent()
+
+    # Get current state
+    existing = {}
+    for site in client.list_target_sites(parent=parent):
+        pattern = site.generated_uri_pattern or site.provided_uri_pattern
+        existing[pattern] = site.name
+
+    desired_set = set(_normalize_uri_pattern(p) for p in desired_patterns if p.strip())
+    existing_set = set(existing.keys())
+
+    to_add = desired_set - existing_set
+    to_remove = existing_set - desired_set
+
+    added = []
+    removed = []
+    errors = []
+
+    # Add new patterns
+    for pattern in to_add:
+        try:
+            op = client.create_target_site(
+                parent=parent,
+                target_site=discoveryengine.TargetSite(
+                    provided_uri_pattern=pattern,
+                    type_=discoveryengine.TargetSite.Type.INCLUDE,
+                ),
+            )
+            op.result()
+            added.append(pattern)
+            logger.info("Vertex: added target site %s", pattern)
+        except Exception as e:
+            errors.append({"pattern": pattern, "action": "add", "error": str(e)})
+            logger.error("Vertex: failed to add %s: %s", pattern, e)
+
+    # Remove stale patterns
+    for pattern in to_remove:
+        try:
+            op = client.delete_target_site(name=existing[pattern])
+            op.result()
+            removed.append(pattern)
+            logger.info("Vertex: removed target site %s", pattern)
+        except Exception as e:
+            errors.append({"pattern": pattern, "action": "remove", "error": str(e)})
+            logger.error("Vertex: failed to remove %s: %s", pattern, e)
+
+    return {"added": added, "removed": removed, "errors": errors}
+
+
 # ── Step 3: Dedup ──────────────────────────────────────────────────────
 
 def deduplicate(results):
-    """Skip URLs already in seen_jobs (same as before). Scores are still stored there for audit/reuse if policy changes."""
+    """Skip URLs already in seen_jobs or errored_jobs."""
     if not results:
         return []
     db = get_db()
     urls = [r["url"] for r in results]
     seen_docs = db.seen_jobs.find({"url": {"$in": urls}}, {"url": 1})
     seen_urls = {doc["url"] for doc in seen_docs}
+    errored_docs = db.errored_jobs.find({"url": {"$in": urls}}, {"url": 1})
+    errored_urls = {doc["url"] for doc in errored_docs}
+    skip_urls = seen_urls | errored_urls
     out = []
     batch_seen = set()
     for r in results:
         u = r.get("url", "")
-        if not u or u in seen_urls or u in batch_seen:
+        if not u or u in skip_urls or u in batch_seen:
             continue
         batch_seen.add(u)
         out.append(r)
@@ -564,7 +847,7 @@ def score_jobs(config, jobs):
         job["disqualifiers"] = result.get("disqualifiers", [])
         job["score_breakdown"] = result.get("score_breakdown", {})
         job["_score_failed"] = result.get("_score_failed", False)
-        logger.info("  Scored %s — %d (%s)", job["url"][:60], job["match_score"], job["title"][:40])
+        logger.info("  Scored %s — %d (%s)", job["url"], job["match_score"], job["title"])
         return job
 
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -582,7 +865,7 @@ def score_jobs(config, jobs):
     matched.sort(key=lambda j: j["match_score"], reverse=True)
     borderline.sort(key=lambda j: j["match_score"], reverse=True)
 
-    return scored, matched, borderline
+    return scored, matched, borderline, failed
 
 
 # ── Step 6: Send email ─────────────────────────────────────────────────
@@ -727,6 +1010,67 @@ def send_ntfy(freshness, matched_count, recipient):
         logger.error("Failed to send ntfy: %s", e)
 
 
+# ── Retry errored jobs ────────────────────────────────────────────────
+
+def retry_errored_jobs(email, on_progress=None):
+    """Re-fetch and re-score all errored jobs. Successful ones move to seen_jobs."""
+    config = load_config(email)
+    if not config:
+        raise RuntimeError(f"No config found for {email}")
+
+    errored = list_errored_jobs()
+    if not errored:
+        return {"retried": 0, "succeeded": 0, "still_errored": 0, "matched": [], "borderline": []}
+
+    if on_progress:
+        on_progress("retry_fetch", f"Re-fetching {len(errored)} errored jobs")
+
+    # Re-fetch pages
+    jobs = [{"url": e["url"], "title": e.get("title", ""), "source": e.get("source", "")} for e in errored]
+
+    def _fetch_and_attach(job):
+        page = fetch_job_page(job["url"])
+        if not job.get("title"):
+            job["title"] = page["title"]
+        job["text"] = page["text"]
+        return job
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        list(pool.map(_fetch_and_attach, jobs))
+
+    if on_progress:
+        on_progress("retry_score", f"Re-scoring {len(jobs)} jobs")
+
+    # Re-score
+    scored, matched, borderline, still_failed = score_jobs(config, jobs)
+
+    # Successful ones: move to seen_jobs, remove from errored_jobs
+    if scored:
+        mark_jobs_seen(scored, scored)
+        remove_from_errored([j["url"] for j in scored])
+
+    # Still-failed ones: update their attempt count (mark_jobs_errored handles $inc)
+    if still_failed:
+        mark_jobs_errored(still_failed)
+
+    # Send email if matches found
+    recipient = config.get("recipient_email", "")
+    if matched or borderline:
+        send_email(recipient, matched, borderline)
+
+    serializable = lambda jlist: [
+        {k: v for k, v in j.items() if k != "text"} for j in jlist
+    ]
+
+    return {
+        "retried": len(errored),
+        "succeeded": len(scored),
+        "still_errored": len(still_failed),
+        "matched": serializable(matched),
+        "borderline": serializable(borderline),
+    }
+
+
 # ── Main run orchestrator ──────────────────────────────────────────────
 
 def run(email, on_progress=None):
@@ -735,7 +1079,7 @@ def run(email, on_progress=None):
     run_record = {
         "id": run_id,
         "timestamp": datetime.now().isoformat(),
-        "status": "running",
+        "status": RunResult.RUNNING,
         "stages": {},
         "jobs_found": 0,
         "jobs_new": 0,
@@ -768,9 +1112,16 @@ def run(email, on_progress=None):
         queries = build_queries(config)
 
         # Step 2: Search
-        progress("search", f"Searching {len(queries)} sites")
-        max_results = config["search"].get("max_results_per_query", 20)
-        all_results = run_searches(queries, max_results, freshness, country, ui_lang)
+        provider = config["search"].get("provider", SearchProvider.BRAVE)
+        progress("search", f"Searching {len(queries)} queries via {provider}")
+        if provider == SearchProvider.VERTEX:
+            max_results = config["search"].get("vertex_max_results", 50)
+        else:
+            max_results = config["search"].get("brave_max_results", 20)
+        if provider == SearchProvider.VERTEX:
+            all_results = run_vertex_searches(queries, max_results)
+        else:
+            all_results = run_searches(queries, max_results, freshness, country, ui_lang)
         run_record["jobs_found"] = len(all_results)
         progress("search", f"Found {len(all_results)} total results")
 
@@ -781,7 +1132,7 @@ def run(email, on_progress=None):
         progress("dedup", f"{len(new_results)} new jobs after dedup")
 
         if not new_results:
-            run_record["status"] = "completed"
+            run_record["status"] = RunResult.COMPLETED
             progress("done", "No new jobs found")
             save_run(run_record)
             send_ntfy(freshness, 0, "")
@@ -802,7 +1153,7 @@ def run(email, on_progress=None):
 
         # Step 5: Score
         progress("score", f"Scoring {len(new_results)} jobs with OpenAI")
-        all_scored, matched, borderline = score_jobs(config, new_results)
+        all_scored, matched, borderline, failed = score_jobs(config, new_results)
         run_record["jobs_scored"] = len(all_scored)
         run_record["jobs_matched"] = len(matched)
         run_record["jobs_borderline"] = len(borderline)
@@ -814,7 +1165,9 @@ def run(email, on_progress=None):
         run_record["borderline_jobs"] = serializable(borderline)
         run_record["all_scored_jobs"] = serializable(all_scored)
 
+        # Only mark successfully scored jobs as seen; failed ones go to errored_jobs
         mark_jobs_seen(all_scored, all_scored)
+        mark_jobs_errored(failed)
 
         # Step 6: Email
         if matched or borderline:
@@ -826,12 +1179,12 @@ def run(email, on_progress=None):
         total_matched = len(matched) + len(borderline)
         send_ntfy(freshness, total_matched, recipient)
 
-        run_record["status"] = "completed"
+        run_record["status"] = RunResult.COMPLETED
         progress("done", f"Done — {len(matched)} matched, {len(borderline)} borderline")
 
     except Exception as e:
         logger.exception("Run failed")
-        run_record["status"] = "error"
+        run_record["status"] = RunResult.ERROR
         run_record["error"] = str(e)
 
     save_run(run_record)
