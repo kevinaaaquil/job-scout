@@ -1,13 +1,23 @@
+import base64
 import copy
 import logging
 import os
 import secrets
+import tempfile
 import threading
 from functools import wraps
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 load_dotenv()
+
+# Decode base64 service account JSON if provided (for Dokku/container deploys)
+_gcp_b64 = os.environ.get("GOOGLE_CREDENTIALS_B64", "")
+if _gcp_b64 and not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+    _tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+    _tmp.write(base64.b64decode(_gcp_b64))
+    _tmp.close()
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _tmp.name
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
